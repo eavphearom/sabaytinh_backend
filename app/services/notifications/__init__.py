@@ -1,0 +1,1 @@
+"""After-commit notification adapters."""

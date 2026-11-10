@@ -1,0 +1,15 @@
+from marshmallow import Schema, fields
+class StockMovementResponseSchema(Schema):
+    id = fields.Integer()
+    variant_stock_id = fields.Integer()
+    unit_id = fields.Integer(allow_none=True)
+    type = fields.String()
+    qty_change = fields.Integer()
+    multiplier = fields.Decimal(as_string=True)
+    base_qty_change = fields.Integer()
+    qty_before = fields.Integer()
+    qty_after = fields.Integer()
+    reference_type = fields.String(allow_none=True)
+    reference_id = fields.Integer(allow_none=True)
+    note = fields.String(allow_none=True)
+    created_at = fields.DateTime(format="%Y-%m-%d %H:%M:%S", allow_none=True)
