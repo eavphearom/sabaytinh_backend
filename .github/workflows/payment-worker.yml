@@ -1,0 +1,44 @@
+
+name: ABA Payment Worker
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: aba-payment-worker
+  cancel-in-progress: false
+
+jobs:
+  reconcile-payments:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run payment worker once
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          SECRET_KEY: ${{ secrets.SECRET_KEY }}
+          JWT_SECRET_KEY: ${{ secrets.JWT_SECRET_KEY }}
+          PAYWAY_SANDBOX_ENABLED: 'true'
+          PAYWAY_BASE_URL: https://checkout-sandbox.payway.com.kh
+          PAYWAY_MERCHANT_ID: ${{ secrets.PAYWAY_MERCHANT_ID }}
+          PAYWAY_API_KEY: ${{ secrets.PAYWAY_API_KEY }}
+          PAYWAY_PUBLIC_API_ENABLED: 'true'
+          PAYWAY_SANDBOX_VERIFIED: 'true'
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python -m app.workers.payment_worker --once
