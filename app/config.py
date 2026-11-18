@@ -15,6 +15,8 @@ class Config:
         "pool_pre_ping": True,
         # Keep QR data and other bound values out of SQL logs and exceptions.
         "hide_parameters": True,
+        "pool_timeout": 3,
+        "connect_args": {"connect_timeout": 3},
     }
 
     SECRET_KEY = os.getenv("SECRET_KEY")
@@ -50,3 +52,8 @@ class Config:
     PAYMENT_WORKER_INTERVAL_SECONDS = int(os.getenv("PAYMENT_WORKER_INTERVAL_SECONDS", "15"))
     PAYMENT_WORKER_BATCH_SIZE = int(os.getenv("PAYMENT_WORKER_BATCH_SIZE", "20"))
     PAYWAY_WORKER_VERIFIED = os.getenv("PAYWAY_WORKER_VERIFIED", "false").lower() == "true"
+    CRON_SECRET = os.getenv("CRON_SECRET")
+    PAYMENT_CRON_BATCH_SIZE = int(os.getenv("PAYMENT_CRON_BATCH_SIZE", "1"))
+    PAYMENT_CRON_BUDGET_SECONDS = float(os.getenv("PAYMENT_CRON_BUDGET_SECONDS", "20"))
+    PAYMENT_CRON_CONNECT_TIMEOUT = float(os.getenv("PAYMENT_CRON_CONNECT_TIMEOUT", "1"))
+    PAYMENT_CRON_READ_TIMEOUT = float(os.getenv("PAYMENT_CRON_READ_TIMEOUT", "2"))

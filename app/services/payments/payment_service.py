@@ -11,6 +11,7 @@ from app.services.payments.payment_strategy import GatewayError
 from app.services.payments.payment_strategy_factory import PaymentStrategyFactory
 from app.services.payments.payment_state_service import PaymentStateService
 from app.utils.date_util import DateUtil
+from app.workers.execution_scope import checkpoint, WorkerStopped, active_execution
 
 
 class PaymentService:
@@ -112,13 +113,19 @@ class PaymentService:
     def reconcile_due(self, limit=100, should_stop=None):
         """Internal scheduler entry point. QR expiry alone never cancels an order."""
         self.state._clean_session()
+        scope = active_execution.get()
+        bounded = bool(scope and scope.deadline is not None)
         try:
             records = [(p.id, p.created_at) for p in PaymentRepository().find_pending_online_for_reconciliation(
-                DateUtil.now(), limit=limit, for_update=False)]
+                DateUtil.now(), limit=min(1000, limit + 1) if bounded else limit, for_update=False)]
         finally:
             db.session.rollback()
+        if bounded and len(records) > limit:
+            scope.issues.add("payment_backlog")
+            records = records[:limit]
         results = {}
         for id, created_at in records:
+            checkpoint()
             if should_stop and should_stop():
                 break
             try:
@@ -127,6 +134,9 @@ class PaymentService:
                     results[id] = {"manual_review_required": True}
                     continue
                 results[id] = self.verify(id)
+            except WorkerStopped:
+                db.session.rollback()
+                raise
             except Exception:
                 db.session.rollback()
                 # Isolate broken records so they cannot starve the remaining

@@ -135,6 +135,8 @@ def create_app():
     from app.routes.v1.admin.dashboard_routes import admin_dashboard_bp
     app.register_blueprint(admin_dashboard_bp)
     register_payway_callback(app)
+    from app.routes.v1.internal_payment_worker_routes import internal_worker_bp
+    app.register_blueprint(internal_worker_bp)
     
     
 

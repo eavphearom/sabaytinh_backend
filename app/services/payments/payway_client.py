@@ -1,3 +1,4 @@
+from app.workers.execution_scope import external_timeouts, read_response
 """PayWay sandbox protocol, verified against official API specifications.
 
 https://developer.payway.com.kh/qr-api-14530840e0.md
@@ -176,17 +177,19 @@ class PayWayClient:
         body = "{" + ",".join(json.dumps(k) + ":" + (
             format(v, "f") if isinstance(v, Decimal) else json.dumps(v)
         ) for k, v in payload.items()) + "}"
+        connect_timeout, read_timeout = external_timeouts(
+            self.config.get("PAYWAY_CONNECT_TIMEOUT", 5), self.config.get("PAYWAY_READ_TIMEOUT", 15))
         connection = http.client.HTTPSConnection(
-            self.HOST, timeout=self.config.get("PAYWAY_CONNECT_TIMEOUT", 5),
+            self.HOST, timeout=connect_timeout,
             context=ssl.create_default_context(),
         )
         operation = {self.QR_PATH: "initialize", self.CHECK_PATH: "verify", self.CLOSE_PATH: "close"}.get(path, "unknown")
         try:
             connection.connect()
-            connection.sock.settimeout(self.config.get("PAYWAY_READ_TIMEOUT", 15))
+            connection.sock.settimeout(read_timeout)
             connection.request("POST", path, body.encode(), {"Content-Type": "application/json"})
             response = connection.getresponse()
-            raw = response.read(2_000_001)
+            raw = read_response(response, connection, 2_000_001, read_timeout)
             if len(raw) > 2_000_000:
                 response_diagnostic(operation, response.status, None)
                 raise GatewayError("Gateway request failed")

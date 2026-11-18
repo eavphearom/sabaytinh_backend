@@ -14,6 +14,7 @@ from app.schemas.order_schema import PaymentResponseSchema
 from app.services.payments.payment_strategy import GatewayError, PaymentContext, GatewayResult
 from app.services.variant_stock_service import VariantStockService
 from app.utils.date_util import DateUtil
+from app.workers.execution_scope import checkpoint, active_execution
 
 
 logger = logging.getLogger(__name__)
@@ -78,6 +79,7 @@ class PaymentStateService:
 
     @staticmethod
     def _locked(payment_id):
+        checkpoint()
         order_id = db.session.scalar(select(Payment.order_id).where(
             Payment.id == payment_id, Payment.is_deleted.is_(False),
         ))
@@ -155,6 +157,7 @@ class PaymentStateService:
             context = PaymentContext(payment.id, order.id, payment.transaction_id,
                 current_app.config["PAYWAY_MERCHANT_ID"], payment.amount, payment.currency, token,
                 close_accepted=payment.close_accepted_at is not None)
+            checkpoint()
             db.session.commit()
             return context
         except Exception:
@@ -253,6 +256,7 @@ class PaymentStateService:
             payment.gateway_lease_until = None
             payment.updated_at = order.updated_at = invoice.updated_at = now
             response = PaymentResponseSchema().dump(payment)
+            checkpoint()
             db.session.commit()
         except Exception:
             db.session.rollback()
@@ -272,6 +276,7 @@ class PaymentStateService:
                 payment.next_check_at = DateUtil.now() + timedelta(seconds=30)
                 payment.gateway_lease_token = None
                 payment.gateway_lease_until = None
+            checkpoint()
             db.session.commit()
         except Exception:
             db.session.rollback()
@@ -289,6 +294,7 @@ class PaymentStateService:
             self._consistent(order, payment, invoice)
             payment.close_accepted_at = payment.close_accepted_at or DateUtil.now()
             payment.updated_at = DateUtil.now()
+            checkpoint()
             db.session.commit()
         except Exception:
             db.session.rollback()
@@ -341,6 +347,7 @@ class PaymentStateService:
             db.session.flush()
             new_context = PaymentContext(replacement.id, order.id, replacement.transaction_id,
                 context.merchant_id, replacement.amount, replacement.currency, token)
+            checkpoint()
             db.session.commit()
             return new_context
         except Exception:
@@ -350,6 +357,7 @@ class PaymentStateService:
     def defer_reconciliation(self, payment_id, manual_review=False):
         """Back off an unprocessable due row without changing financial state."""
         self._clean_session()
+        checkpoint()
         try:
             payment = db.session.scalar(select(Payment).where(
                 Payment.id == payment_id, Payment.is_deleted.is_(False)
@@ -362,6 +370,7 @@ class PaymentStateService:
                 payment.next_check_at = None if manual_review else now + timedelta(minutes=5)
                 payment.checkout_message = ("Manual review required: outside automated check window"
                     if manual_review else "Reconciliation deferred; review unresolved payment if persistent")
+            checkpoint()
             db.session.commit()
         except Exception:
             db.session.rollback()
@@ -397,6 +406,7 @@ class PaymentStateService:
             review = payment.gateway_state == "REFUND_REVIEW_NOTIFY_PENDING"
             event = {"event_id": f"payment:{payment.id}:paid", "payment_id": payment.id,
                      "order_id": order.id, "refund_review": review}
+            checkpoint()
             db.session.commit()
             # No open transaction or locks across the external hook.
             self.paid_hook(event)
@@ -404,6 +414,7 @@ class PaymentStateService:
             if payment.gateway_lease_token == token:
                 payment.gateway_state = "REFUND_REVIEW" if review else "PAID"
                 payment.gateway_lease_token = payment.gateway_lease_until = None
+            checkpoint()
             db.session.commit()
             return True
         except Exception as error:
@@ -414,6 +425,7 @@ class PaymentStateService:
                     _, payment, _ = self._locked(payment_id)
                     if payment.gateway_lease_token == token:
                         payment.gateway_lease_until = DateUtil.now() + timedelta(seconds=error.retry_after)
+                    checkpoint()
                     db.session.commit()
                 except Exception:
                     db.session.rollback()
@@ -425,12 +437,25 @@ class PaymentStateService:
         self._clean_session()
         if type(limit) is not int or not 1 <= limit <= 1000:
             raise ValueError("Invalid notification batch size")
+        scope = active_execution.get()
+        bounded = bool(scope and scope.deadline is not None)
         try:
             ids = db.session.scalars(select(Payment.id).where(
                 Payment.is_deleted.is_(False), Payment.payment_status == "PAID",
                 Payment.gateway_state.in_(self.NOTIFICATION_STATES),
                 (Payment.gateway_lease_until.is_(None)) | (Payment.gateway_lease_until <= DateUtil.now()),
-            ).order_by(Payment.id).limit(limit)).all()
+            ).order_by(Payment.id).limit(min(1000, limit + 1) if bounded else limit)).all()
         finally:
             db.session.rollback()
-        return sum(self.dispatch_paid_notification(id) for id in ids)
+        if bounded and len(ids) > limit:
+            scope.issues.add("notification_backlog")
+            ids = ids[:limit]
+        delivered = 0
+        for id in ids:
+            checkpoint()
+            success = self.dispatch_paid_notification(id)
+            delivered += bool(success)
+            scope = active_execution.get()
+            if not success and scope:
+                scope.issues.add("telegram_deferred")
+        return delivered

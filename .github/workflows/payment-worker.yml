@@ -3,8 +3,7 @@ name: ABA Payment Worker
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "2-59/5 * * * *"
+  # Automatic scheduling is owned by cron-job.org. Manual rollback only.
 
 permissions:
   contents: read
@@ -39,8 +38,8 @@ jobs:
           PAYWAY_BASE_URL: https://checkout-sandbox.payway.com.kh
           PAYWAY_MERCHANT_ID: ${{ secrets.PAYWAY_MERCHANT_ID }}
           PAYWAY_API_KEY: ${{ secrets.PAYWAY_API_KEY }}
-          PAYWAY_PUBLIC_API_ENABLED: 'true'
-          PAYWAY_SANDBOX_VERIFIED: 'true'
+          PAYWAY_PUBLIC_API_ENABLED: 'false'
+          PAYWAY_SANDBOX_VERIFIED: 'false'
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python -m app.workers.payment_worker --once

@@ -7,6 +7,7 @@ from threading import Event
 from sqlalchemy import text
 
 from app.extensions import db
+from app.workers.execution_scope import ExecutionScope, execution_scope, active_execution, checkpoint, WorkerStopped
 from app.services.notifications.telegram_notification_service import TelegramNotificationService
 from app.services.payments.payment_service import PaymentService
 from app.services.payments.payway_client import PayWayClient
@@ -34,37 +35,68 @@ class PaymentWorker:
         with self.app.app_context():
             if db.engine.dialect.name != "postgresql":
                 raise RuntimeError("The payment worker requires PostgreSQL")
+            if db.engine.url.port == 6543:
+                raise RuntimeError("Session advisory locks require Session Pooler or direct PostgreSQL")
             with db.engine.connect().execution_options(isolation_level="AUTOCOMMIT") as coordinator:
-                acquired = coordinator.scalar(text("SELECT pg_try_advisory_lock(:namespace, :id)"),
-                    {"namespace": LOCK_NAMESPACE, "id": LOCK_ID})
+                try:
+                    acquired = coordinator.scalar(text("SELECT pg_try_advisory_lock(:namespace, :id)"),
+                        {"namespace": LOCK_NAMESPACE, "id": LOCK_ID})
+                except Exception:
+                    coordinator.invalidate()
+                    raise WorkerStopped("Worker lock acquisition failed") from None
                 if not acquired:
                     return {"leader": False}
-                try:
-                    results = {"leader": True}
-                    jobs = (("payments", self._payments), ("telegram", self._telegram))
-                    for name, job in jobs:
-                        if self.stop.is_set():
-                            break
-                        # A broken coordination connection must not silently
-                        # reconnect and continue without owning the lock.
-                        coordinator.scalar(text("SELECT 1"))
-                        try:
-                            results[name] = job()
-                            logger.info("Payment worker job=%s completed", name)
-                        except Exception:
-                            # Never log exception text/tracebacks: they may
-                            # contain provider URLs, credentials or SQL values.
-                            logger.error("Payment worker job=%s deferred; inspect configuration and review queue", name)
-                            results[name] = "deferred"
-                        finally:
-                            db.session.remove()
-                    return results
-                finally:
+                def guard():
+                    if coordinator.closed or coordinator.invalidated:
+                        raise WorkerStopped("Worker coordinator lost")
                     try:
-                        coordinator.scalar(text("SELECT pg_advisory_unlock(:namespace, :id)"),
+                        owned = coordinator.scalar(text(
+                            "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE locktype='advisory' "
+                            "AND pid=pg_backend_pid() AND classid=:namespace AND objid=:id "
+                            "AND objsubid=2 AND granted)"),
                             {"namespace": LOCK_NAMESPACE, "id": LOCK_ID})
+                        if not owned:
+                            raise WorkerStopped("Worker lock lost")
+                    except Exception:
+                        coordinator.invalidate()
+                        raise WorkerStopped("Worker coordinator lost") from None
+                scope = active_execution.get() or ExecutionScope()
+                scope.coordinator_guard = guard
+                try:
+                    with execution_scope(scope):
+                        results = {"leader": True}
+                        jobs = (("payments", self._payments), ("telegram", self._telegram))
+                        for name, job in jobs:
+                            if self.stop.is_set():
+                                results[name] = "deferred"
+                                continue
+                            try:
+                                checkpoint()
+                                results[name] = job()
+                                checkpoint()
+                                logger.info("Payment worker job=%s finished", name)
+                            except WorkerStopped:
+                                results[name] = "deferred"
+                                scope.issues.add("execution_stopped")
+                                break
+                            except Exception:
+                                logger.error("Payment worker job=%s deferred", name)
+                                results[name] = "deferred"
+                            finally:
+                                db.session.remove()
+                        return results
+                finally:
+                    scope.coordinator_guard = None
+                    try:
+                        if coordinator.closed or coordinator.invalidated:
+                            raise WorkerStopped("Worker coordinator lost")
+                        released = coordinator.scalar(text("SELECT pg_advisory_unlock(:namespace, :id)"),
+                            {"namespace": LOCK_NAMESPACE, "id": LOCK_ID})
+                        if not released:
+                            raise WorkerStopped("Worker unlock failed")
                     except Exception:
                         coordinator.invalidate()  # Never pool a session holding this lock.
+                        raise WorkerStopped("Worker coordinator release failed") from None
 
     def _payments(self):
         # Missing credentials must not claim or reschedule financial records.
@@ -73,7 +105,13 @@ class PaymentWorker:
         except (GatewayError, ValueError):
             logger.warning("Payment reconciliation disabled or sandbox configuration incomplete")
             return "not_configured"
-        return PaymentService().reconcile_due(limit=self.batch_size, should_stop=self.stop.is_set)
+        service = PaymentService()
+        scope = active_execution.get()
+        if scope and scope.deadline is not None:
+            # Settlement retains its durable notification marker. The separate
+            # Telegram job owns this invocation's bounded delivery budget.
+            service.state.paid_hook = None
+        return service.reconcile_due(limit=self.batch_size, should_stop=self.stop.is_set)
 
     def _telegram(self):
         if not self.app.config.get("TELEGRAM_BOT_TOKEN") or not self.app.config.get("TELEGRAM_CHAT_ID"):

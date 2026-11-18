@@ -12,6 +12,7 @@ from sqlalchemy.orm import selectinload
 from app.extensions import db
 from app.models import Order, OrderItem, Payment
 from app.utils.date_util import DateUtil
+from app.workers.execution_scope import external_timeouts, read_response
 
 
 class NotificationDeliveryError(Exception):
@@ -129,14 +130,15 @@ class TelegramNotificationService:
         connection = None
         try:
             # Fixed HTTPS host, no redirects, no request/response logging.
-            connection = http.client.HTTPSConnection("api.telegram.org", timeout=5,
+            connect_timeout, read_timeout = external_timeouts(5, 15)
+            connection = http.client.HTTPSConnection("api.telegram.org", timeout=connect_timeout,
                                                      context=ssl.create_default_context())
             connection.connect()
-            connection.sock.settimeout(15)
+            connection.sock.settimeout(read_timeout)
             connection.request("POST", f"/bot{token}/sendMessage", body=payload,
                                headers={"Content-Type": "application/json"})
             response = connection.getresponse()
-            raw = response.read(65537)
+            raw = read_response(response, connection, 65537, read_timeout)
             if len(raw) > 65536:
                 raise NotificationDeliveryError("Telegram response is invalid")
             data = json.loads(raw)
