@@ -149,6 +149,7 @@ def create_app():
                     "http://localhost:5174",
                     "http://127.0.0.1:5174",
                     "https://websabaytinh.vercel.app",
+                    "https://sabaytinh-admin.vercel.app",
                 ]
             }
         },
