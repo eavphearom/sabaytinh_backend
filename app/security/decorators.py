@@ -4,7 +4,7 @@ from flask import g
 
 from flask_jwt_extended import jwt_required, get_jwt_identity
 
-from app.repositories.user_repository import UserRepository
+from app.security.jwt_utils import authenticated_user
 from app.exceptions.api_exception import (
     UnauthorizedException,
     ForbiddenException,
@@ -15,7 +15,7 @@ def admin_required(fn):
     @wraps(fn)
     @jwt_required()
     def wrapper(*args, **kwargs):
-        user = UserRepository().find_by_id(
+        user = authenticated_user(
             int(get_jwt_identity())
         )
 
@@ -48,7 +48,7 @@ def customer_required(fn):
                 raise ValueError
         except (ValueError, TypeError):
             raise UnauthorizedException("Invalid customer identity")
-        user = UserRepository().find_by_id(user_id)
+        user = authenticated_user(user_id)
         if (user is None or user.status != "ACTIVE" or user.role is None
                 or user.role.is_deleted or not user.role.is_active):
             raise UnauthorizedException("Customer account is unavailable")

@@ -1,6 +1,7 @@
 import os
 import unittest
 from datetime import datetime
+import sqlalchemy as sa
 from app.extensions import db
 from app.models import User
 from app.routes.v1.auth import auth_bp
@@ -56,3 +57,27 @@ class AuthMeTests(unittest.TestCase):
         db.session.get(User, 2).is_deleted = True
         db.session.commit()
         self.assertEqual(self.client.get("/api/v1/auth/me", headers=self.headers[2]).status_code, 401)
+
+    def test_profile_uses_one_query_and_rechecks_each_request(self):
+        db.session.remove()
+        statements = []
+        def record(conn, cursor, statement, parameters, context, many):
+            if statement.lstrip().upper().startswith("SELECT"):
+                statements.append(statement)
+        sa.event.listen(db.engine, "before_cursor_execute", record)
+        try:
+            response = self.client.get("/api/v1/auth/me", headers=self.headers[1])
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(len(statements), 1)
+            self.assertEqual(response.json["data"]["id"], 1)
+            statements.clear()
+            response = self.client.get("/api/v1/auth/me", headers=self.headers[2])
+            self.assertEqual(response.json["data"]["id"], 2)
+            self.assertEqual(len(statements), 1)
+            from app.models import RefreshSession
+            db.session.execute(sa.update(RefreshSession).where(
+                RefreshSession.user_id == 2).values(revoked=True))
+            db.session.commit()
+            self.assertEqual(self.client.get("/api/v1/auth/me", headers=self.headers[2]).status_code, 401)
+        finally:
+            sa.event.remove(db.engine, "before_cursor_execute", record)

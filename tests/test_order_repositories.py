@@ -88,6 +88,7 @@ class OrderRepositoryTests(unittest.TestCase):
         self.assertTrue(self.repo.soft_delete_by_id(1, deleted_uid=1, reason="test"))
         self.assertIsNone(self.repo.find_by_id(1))
         self.assertIsNone(self.repo.find_by_code("ORD-1"))
+
         self.assertIs(self.repo.find_by_id(1, include_deleted=True), order)
         self.assertEqual(order.deleted_reason, "test")
         self.assertFalse(self.repo.soft_delete_by_id(999))
@@ -95,6 +96,31 @@ class OrderRepositoryTests(unittest.TestCase):
         for value in (None, 0, True, "1"):
             with self.assertRaises(BadRequestException):
                 self.repo.find_customer_history(value, BaseFilter())
+
+    def test_detail_query_budget_and_list_does_not_load_qr_image(self):
+        self.order(1)
+        self.item(1, 1)
+        self.payment(1, 1, qr_image="data:image/png;base64,test")
+        db.session.commit()
+        db.session.remove()
+        statements = []
+        def record(conn, cursor, statement, parameters, context, many):
+            statements.append(statement)
+        sa.event.listen(db.engine, "before_cursor_execute", record)
+        try:
+            order = self.repo.find_by_id(1)
+            self.assertEqual(order.customer.username, "Dara")
+            self.assertEqual(order.delivery_method.name, "Delivery")
+            self.assertIsNone(order.invoice)
+            self.assertEqual(order.payments[0].qr_image, "data:image/png;base64,test")
+            self.assertEqual(len(statements), 4)
+            db.session.remove()
+            statements.clear()
+            order = db.session.scalar(self.repo._loaded_query(detail=False))
+            self.assertIn("qr_image", sa.inspect(order.payments[0]).unloaded)
+            self.assertEqual(len(statements), 3)
+        finally:
+            sa.event.remove(db.engine, "before_cursor_execute", record)
 
     def test_filters_search_dates_and_pagination(self):
         self.order(1, order_code="ORD-100%", order_status="PROCESSING", payment_status="PAID")
@@ -203,7 +229,7 @@ class OrderRepositoryTests(unittest.TestCase):
             for row in result["items"]:
                 _ = row.customer.username, len(row.items), len(row.payments)
             self.assertEqual(len(statements), count)
-            self.assertEqual(count, 5)  # count + orders + three select-in batches
+            self.assertEqual(count, 4)  # count + joined orders/customer + items + payments
         finally:
             sa.event.remove(db.engine, "before_cursor_execute", record)
 

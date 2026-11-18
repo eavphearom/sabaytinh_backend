@@ -1,7 +1,7 @@
 from datetime import date, datetime, time, timedelta
 
 from sqlalchemy import func, or_, select
-from sqlalchemy.orm import selectinload
+from sqlalchemy.orm import joinedload, selectinload
 
 from app.common.base_repository import BaseRepository
 from app.common.pagination import PaginationUtil
@@ -23,15 +23,19 @@ class OrderRepository(BaseRepository):
         super().__init__(Order)
 
     def _loaded_query(self, include_deleted=False, detail=True):
+        payments = selectinload(Order.payments.and_(Payment.is_deleted.is_(False)))
+        if not detail:
+            # List cards need payment metadata, not the large stored QR image.
+            payments = payments.defer(Payment.qr_image)
         options = [
-            selectinload(Order.customer.and_(User.is_deleted.is_(False))),
+            joinedload(Order.customer.and_(User.is_deleted.is_(False))),
             selectinload(Order.items.and_(OrderItem.is_deleted.is_(False))),
-            selectinload(Order.payments.and_(Payment.is_deleted.is_(False))),
+            payments,
         ]
         if detail:
             options.extend([
-                selectinload(Order.delivery_method.and_(DeliveryMethod.is_deleted.is_(False))),
-                selectinload(Order.invoice.and_(Invoice.is_deleted.is_(False))),
+                joinedload(Order.delivery_method.and_(DeliveryMethod.is_deleted.is_(False))),
+                joinedload(Order.invoice.and_(Invoice.is_deleted.is_(False))),
                 selectinload(Order.status_histories.and_(OrderStatusHistory.is_deleted.is_(False))),
             ])
         # Refresh already-loaded relationships so deleted children cannot leak

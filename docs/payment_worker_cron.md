@@ -29,8 +29,13 @@ exhaustion return partial/failure, not a misleading successful completion.
 | 503 | partial | Some work failed, was unconfigured, needs review, or remains queued |
 | 503 | failed | Configuration, coordinator, or unexpected execution failure |
 
-Successful/partial responses include only `payments_checked` and
-`notifications_delivered` counts. They do not prove a particular order was paid.
+Successful/partial responses contain aggregate counts and fixed operational
+codes, never payment details. `outcome=reconciliation_incomplete` distinguishes
+unresolved evidence, manual review and backlog from `outcome=operational_failure`
+(budget, coordination, database or execution failures). Both remain HTTP 503.
+`payments_checked` counts processed records, including failures/manual review;
+it does not mean that many payments were approved. Additional counts are
+`payments_unresolved`, `payments_manual_review` and `notifications_delivered`.
 
 ## Concurrency and time budget
 
@@ -41,7 +46,8 @@ reliably inferred from every custom hostname/port: verify it in Supabase.
 
 One pinned AUTOCOMMIT coordinator connection owns the existing session advisory
 lock across short financial transactions. Ownership is checked before jobs,
-gateway I/O, state operations/commits, and bounded-mode SQL statements. An
+gateway I/O, and state operations/commits. SQL statements and response-body
+chunks check the deadline locally, without a remote ownership query each time. An
 invalidated coordinator is never silently reconnected. Unlock failure invalidates
 the connection and reports failure. Acquisition errors also invalidate it. A
 separate database connection runs the financial transactions. Keep at least two
@@ -221,6 +227,41 @@ the bearer credential: restrict access to its account and use HTTPS only.
     ការបើក public checkout ត្រូវការលក្ខខណ្ឌ Sandbox ផ្សេងទៀត និងការអនុញ្ញាតដាច់ដោយឡែក។
 
 ## Verification status and references
+
+### Diagnosing cron HTTP 503
+
+The original `validation_failure=unclassified_failure` is insufficient to prove
+an ABA protocol error. The previous decorator also used that label for the local
+`WorkerStopped` exception. The worker could then replace a partly completed
+batch with `deferred`, losing its count and reporting `checked=0`.
+
+Worker aborts now log `worker_abort=insufficient_io_budget`,
+`time_budget_exhausted`, or a specific coordinator reason, with a fixed stage,
+elapsed/remaining milliseconds and coordinator-check count. Transport failures
+report timeout/transport/JSON categories. Existing HTTP/gateway codes and
+amount/currency/transaction validation diagnostics remain intact. No exception
+text, secret, QR content or raw response is added to logs.
+
+Removing per-statement/per-body-chunk coordinator round trips reduces remote
+database overhead without removing the operation, gateway and commit ownership
+checks. Progress already recorded in a batch is preserved on interruption.
+Old records outside the seven-day window are routed to review without consuming
+the selected batch's gateway-call quota. Candidate scanning remains bounded.
+An ambiguous record is deferred without settlement; other eligible records can
+continue within the batch limit/budget or in a later invocation.
+
+During investigation a read-only aggregate check found three pending payments,
+three RECONCILE_REQUIRED records, two pending due records, one pending record
+older than seven days and one pending unscheduled record. These counts are not
+proof of the historical invocation's exact failure and may change over time.
+No deployed record was modified. Exact deployed cause requires the new logs.
+
+After pushing and redeploying, inspect `outcome`, `reasons` and the matching
+`worker_abort`/`transport_failure` log. Do not reset transaction IDs or force
+PAID/CANCELLED to clear a 503. No credential, header, routing, readiness or
+migration changes are needed for this fix. Local regression run: 286 tests,
+284 passed and two live tests skipped, using temporary localhost PostgreSQL
+with external HTTPS blocked. The live deployment has not been retested here.
 
 No deployment credentials, linked Vercel project, or verified backend domain were
 available in this workspace. No deployment, scheduler creation, readiness change,

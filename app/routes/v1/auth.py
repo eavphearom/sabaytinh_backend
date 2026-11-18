@@ -18,8 +18,8 @@ from app.exceptions.api_exception import (
     BadRequestException,
     UnauthorizedException,
 )
-from app.repositories.user_repository import UserRepository
 from app.utils.file_util import FileUtil
+from app.security.jwt_utils import authenticated_user
 
 
 auth_bp = Blueprint(
@@ -101,7 +101,7 @@ def logout():
 def get_profile():
     user_id = int(get_jwt_identity())
 
-    user = UserRepository().find_by_id(user_id)
+    user = authenticated_user(user_id)
 
     if (
         user is None
