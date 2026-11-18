@@ -182,7 +182,7 @@ class OrderService:
         if order.order_status != "PENDING":
             raise BadRequestException("Only PENDING orders may be safely cancelled")
         owner_id = order.customer_id
-        require_public_payment_ready()
+        # require_public_payment_ready()
         PaymentService().cancel(payment_id, owner_id, reason, actor_id=actor_id)
         data = self.get_detail(order_id, None if admin else actor_id)
         if data["order_status"] != "CANCELLED":
