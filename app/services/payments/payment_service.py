@@ -2,6 +2,7 @@ import logging
 from datetime import timedelta
 
 from sqlalchemy import select
+from sqlalchemy.exc import SQLAlchemyError
 
 from app.exceptions.api_exception import BadRequestException
 from app.extensions import db
@@ -11,7 +12,7 @@ from app.services.payments.payment_strategy import GatewayError
 from app.services.payments.payment_strategy_factory import PaymentStrategyFactory
 from app.services.payments.payment_state_service import PaymentStateService
 from app.utils.date_util import DateUtil
-from app.workers.execution_scope import checkpoint, WorkerStopped, active_execution
+from app.workers.execution_scope import checkpoint, WorkerStopped, active_execution, set_stage
 
 
 class PaymentService:
@@ -24,6 +25,7 @@ class PaymentService:
     def _run(self, payment_id, operation, customer_id=None, reason=None, actor_id=None):
         # Validate gateway configuration before touching financial state.
         strategy = PaymentStrategyFactory.resolve("ONLINE")
+        set_stage("payment_claim")
         context = self.state.claim(payment_id, operation, customer_id)
         if context is None:
             return self.state.response(payment_id)
@@ -37,6 +39,7 @@ class PaymentService:
                 self.state._evidence(context, result)
                 if operation == "cancel" and result.status != "APPROVED":
                     result = strategy.close(context)
+            set_stage("payment_apply")
             return self.state.apply(context, result, operation, reason, actor_id=actor_id)
         except Exception:
             # Preserve transaction ID on uncertain initialization: never retry
@@ -115,15 +118,16 @@ class PaymentService:
         self.state._clean_session()
         scope = active_execution.get()
         bounded = bool(scope and scope.deadline is not None)
+        set_stage("payment_selection")
         try:
             records = [(p.id, p.created_at) for p in PaymentRepository().find_pending_online_for_reconciliation(
-                DateUtil.now(), limit=min(1000, limit + 1) if bounded else limit, for_update=False)]
+                DateUtil.now(), limit=min(1000, limit * 3 + 1) if bounded else limit, for_update=False)]
         finally:
             db.session.rollback()
-        if bounded and len(records) > limit:
-            scope.issues.add("payment_backlog")
-            records = records[:limit]
         results = {}
+        if scope:
+            scope.payment_results = results
+        attempts = 0
         for id, created_at in records:
             checkpoint()
             if should_stop and should_stop():
@@ -133,12 +137,19 @@ class PaymentService:
                     self.state.defer_reconciliation(id, manual_review=True)
                     results[id] = {"manual_review_required": True}
                     continue
+                if bounded and attempts >= limit:
+                    scope.issues.add("payment_backlog")
+                    break
+                attempts += 1
                 results[id] = self.verify(id)
             except WorkerStopped:
                 db.session.rollback()
                 raise
-            except Exception:
+            except Exception as exc:
                 db.session.rollback()
+                if scope and not isinstance(exc, (GatewayError, BadRequestException)):
+                    scope.issues.add("database_failure" if isinstance(exc, SQLAlchemyError)
+                                     else "payment_operation_failure")
                 # Isolate broken records so they cannot starve the remaining
                 # batch. Existing gateway errors already schedule a short retry.
                 try:
@@ -147,4 +158,6 @@ class PaymentService:
                     db.session.rollback()
                 logging.getLogger(__name__).warning("Payment reconciliation deferred payment_id=%s", id)
                 results[id] = {"verification_pending": True}
+        if bounded and len(records) == min(1000, limit * 3 + 1):
+            scope.issues.add("payment_backlog")
         return results

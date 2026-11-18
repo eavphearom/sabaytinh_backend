@@ -57,6 +57,9 @@ class PaymentWorker:
                             {"namespace": LOCK_NAMESPACE, "id": LOCK_ID})
                         if not owned:
                             raise WorkerStopped("Worker lock lost")
+                    except WorkerStopped:
+                        coordinator.invalidate()
+                        raise
                     except Exception:
                         coordinator.invalidate()
                         raise WorkerStopped("Worker coordinator lost") from None
@@ -71,17 +74,24 @@ class PaymentWorker:
                                 results[name] = "deferred"
                                 continue
                             try:
+                                scope.stage = name
                                 checkpoint()
                                 results[name] = job()
                                 checkpoint()
                                 logger.info("Payment worker job=%s finished", name)
-                            except WorkerStopped:
-                                results[name] = "deferred"
-                                scope.issues.add("execution_stopped")
+                            except WorkerStopped as exc:
+                                # Preserve already committed progress even when
+                                # the subsequent checkpoint/batch is interrupted.
+                                results.setdefault(name, (scope.payment_results or "deferred") if name == "payments"
+                                                   else scope.notifications_delivered)
+                                scope.issues.add(exc.reason)
+                                logger.warning("Payment worker job=%s stopped=%s diagnostics=%s",
+                                               name, exc.reason, scope.diagnostics())
                                 break
                             except Exception:
                                 logger.error("Payment worker job=%s deferred", name)
                                 results[name] = "deferred"
+                                scope.issues.add("job_failure")
                             finally:
                                 db.session.remove()
                         return results

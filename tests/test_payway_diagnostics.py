@@ -76,6 +76,19 @@ class PayWayDiagnosticTests(unittest.TestCase):
         self.assertIn("transport_or_json_failure", " ".join(logs.output))
         self.assertNotIn("private-secret", " ".join(logs.output))
 
+    def test_worker_budget_is_not_reported_as_gateway_validation_failure(self):
+        from app.workers.execution_scope import ExecutionScope, execution_scope, WorkerStopped
+        with execution_scope(ExecutionScope(1)), patch("http.client.HTTPSConnection") as http, \
+             self.assertLogs("app.services.payments.payway_client") as logs:
+            with self.assertRaises(WorkerStopped):
+                self.client.verify(self.context)
+            http.assert_not_called()
+        text = " ".join(logs.output)
+        self.assertIn("worker_abort=insufficient_io_budget", text)
+        self.assertIn("gateway_admission", text)
+        self.assertNotIn("validation_failure", text)
+        self.assertNotIn("unit-test-key", text)
+
 
     def test_currency_formats_are_visible_without_currency_values(self):
         from app.services.payments.payway_client import currency_diagnostic

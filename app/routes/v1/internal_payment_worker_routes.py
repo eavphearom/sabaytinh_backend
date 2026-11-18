@@ -5,7 +5,7 @@ import math
 
 from flask import Blueprint, current_app, jsonify, request
 
-from app.workers.execution_scope import ExecutionScope, execution_scope
+from app.workers.execution_scope import ExecutionScope, execution_scope, WorkerStopped
 from app.workers.payment_worker import PaymentWorker
 
 
@@ -50,19 +50,39 @@ def run_worker():
             logger.info("Payment cron skipped: batch already running")
             return jsonify(status="skipped", reason="already_running"), 200
         payments, telegram = result.get("payments"), result.get("telegram")
+        # Only fixed operational codes and aggregate counts leave this endpoint.
+        reasons = set(scope.issues)
+        unresolved = review = 0
         issues = bool(scope.issues)
         payment_count = len(payments) if isinstance(payments, dict) else 0
         if isinstance(payments, dict):
+            unresolved = sum(bool(row.get("verification_pending")) for row in payments.values() if isinstance(row, dict))
+            review = sum(bool(row.get("manual_review_required")) for row in payments.values() if isinstance(row, dict))
+            if unresolved:
+                reasons.add("verification_unresolved")
+            if review:
+                reasons.add("manual_review_required")
             issues |= any(not isinstance(row, dict) or row.get("verification_pending")
                           or row.get("manual_review_required") for row in payments.values())
         else:
             issues = True
+            reasons.add("payments_" + (payments if payments in ("not_configured", "deferred") else "failed"))
         issues |= type(telegram) is not int
+        if type(telegram) is not int:
+            reasons.add("telegram_" + (telegram if telegram in ("not_configured", "deferred") else "deferred"))
         status = "partial" if issues else "completed"
-        logger.info("Payment cron status=%s checked=%d delivered=%d", status, payment_count,
-                    telegram if type(telegram) is int else 0)
+        operational = reasons - {"verification_unresolved", "manual_review_required", "payment_backlog", "notification_backlog"}
+        outcome = "operational_failure" if operational else ("reconciliation_incomplete" if issues else "batch_completed")
+        logger.info("Payment cron status=%s checked=%d delivered=%d outcome=%s reasons=%s diagnostics=%s",
+                    status, payment_count, telegram if type(telegram) is int else 0, outcome,
+                    sorted(reasons), scope.diagnostics())
         return jsonify(status=status, payments_checked=payment_count,
+                       outcome=outcome, reasons=sorted(reasons), payments_unresolved=unresolved,
+                       payments_manual_review=review,
                        notifications_delivered=telegram if type(telegram) is int else 0), 503 if issues else 200
+    except WorkerStopped as exc:
+        logger.error("Payment cron operational_failure=%s", exc.reason)
+        return jsonify(status="failed", outcome="operational_failure", reason=exc.reason), 503
     except Exception:
         logger.error("Payment cron failed; inspect configuration and worker health")
         return jsonify(status="failed"), 503

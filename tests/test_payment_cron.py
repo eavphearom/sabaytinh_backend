@@ -189,6 +189,31 @@ class CronWorkerTests(unittest.TestCase):
         with execution_scope(ExecutionScope(1)), self.assertRaises(WorkerStopped):
             external_timeouts(5, 15)
 
+    def test_per_statement_budget_checks_do_not_add_coordinator_round_trips(self):
+        from app.workers.execution_scope import check_before_worker_query, checkpoint
+        scope = ExecutionScope(20)
+        scope.coordinator_guard = MagicMock()
+        connection = MagicMock()
+        connection.get_execution_options.return_value = {}
+        with execution_scope(scope):
+            for _ in range(30):
+                check_before_worker_query(connection, None, None, None, None, None)
+            scope.coordinator_guard.assert_not_called()
+            checkpoint()
+            scope.coordinator_guard.assert_called_once()
+
+    def test_progress_survives_budget_abort_mid_batch(self):
+        from app.workers.execution_scope import active_execution
+        scope = ExecutionScope(20)
+        def partial():
+            active_execution.get().payment_results[123] = {"payment_status": "PENDING"}
+            raise WorkerStopped("Worker external request budget insufficient")
+        with execution_scope(scope), patch.object(PaymentWorker, "_payments", side_effect=partial):
+            result = PaymentWorker(self.app).tick()
+        self.assertEqual(len(result["payments"]), 1)
+        self.assertIn("insufficient_io_budget", scope.issues)
+        self.assertFalse(self.lock.locked())
+
 
 @unittest.skipUnless(os.getenv("CHECKOUT_TEST_DATABASE_URL"), "Isolated PostgreSQL URL required")
 class CronPostgresTests(unittest.TestCase):
@@ -259,3 +284,74 @@ class CronPostgresTests(unittest.TestCase):
         self.assertEqual(self.payment().payment_status, "PENDING")
         self.assertIsNotNone(self.payment().gateway_lease_token)
         db.session.remove()
+
+    def add_second_due_payment(self):
+        from app.extensions import db
+        from app.models import Payment
+        from app.services.checkout_service import CheckoutService
+        from app.services.payments.payment_service import PaymentService
+        from app.utils.date_util import DateUtil
+        from datetime import timedelta
+        ids = CheckoutService().checkout(1, self.payload(quantity=1))
+        PaymentService().initialize(ids["payment_id"])
+        db.session.get(Payment, ids["payment_id"]).next_check_at = DateUtil.now() - timedelta(seconds=1)
+        db.session.commit()
+        db.session.remove()
+        return ids["payment_id"]
+
+    def test_ambiguous_record_does_not_block_next_payment(self):
+        from app.extensions import db
+        from app.models import Payment
+        from app.services.payments.payment_strategy import GatewayError
+        new_id = self.add_second_due_payment()
+        self.app.config["PAYMENT_CRON_BATCH_SIZE"] = 2
+        def verify(context):
+            if context.payment_id == self.payment_id:
+                raise GatewayError("Gateway rejected request or returned malformed status")
+            return self.gateway.evidence(context, "APPROVED")
+        with patch.object(self.gateway, "verify", side_effect=verify), \
+             patch("app.services.notifications.telegram_notification_service.TelegramNotificationService._send", return_value=7):
+            response = self.trigger()
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json["outcome"], "reconciliation_incomplete")
+        self.assertEqual(response.json["payments_checked"], 2)
+        self.assertEqual(response.json["payments_unresolved"], 1)
+        self.assertEqual(self.payment().payment_status, "PENDING")
+        self.assertEqual(db.session.get(Payment, new_id).payment_status, "PAID")
+
+    def test_old_record_does_not_consume_gateway_slot(self):
+        from app.extensions import db
+        from app.models import Payment
+        from app.utils.date_util import DateUtil
+        from datetime import timedelta
+        new_id = self.add_second_due_payment()
+        self.payment().created_at = DateUtil.now() - timedelta(days=8)
+        db.session.commit()
+        db.session.remove()
+        self.app.config["PAYMENT_CRON_BATCH_SIZE"] = 1
+        self.gateway.status = "APPROVED"
+        with patch.object(self.gateway, "verify", wraps=self.gateway.verify) as verify, \
+             patch("app.services.notifications.telegram_notification_service.TelegramNotificationService._send", return_value=7):
+            response = self.trigger()
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json["payments_manual_review"], 1)
+        verify.assert_called_once()
+        self.assertEqual(db.session.get(Payment, new_id).payment_status, "PAID")
+        self.assertIsNone(self.payment().next_check_at)
+        self.assertEqual(self.payment().payment_status, "PENDING")
+
+    def test_batch_one_backoff_allows_next_invocation_to_process_other_payment(self):
+        from app.extensions import db
+        from app.models import Payment
+        from app.services.payments.payment_strategy import GatewayError
+        new_id = self.add_second_due_payment()
+        self.app.config["PAYMENT_CRON_BATCH_SIZE"] = 1
+        def verify(context):
+            if context.payment_id == self.payment_id:
+                raise GatewayError("Gateway rejected request or returned malformed status")
+            return self.gateway.evidence(context, "APPROVED")
+        with patch.object(self.gateway, "verify", side_effect=verify), \
+             patch("app.services.notifications.telegram_notification_service.TelegramNotificationService._send", return_value=7):
+            self.assertEqual(self.trigger().status_code, 503)
+            self.assertEqual(self.trigger().status_code, 200)
+        self.assertEqual(db.session.get(Payment, new_id).payment_status, "PAID")

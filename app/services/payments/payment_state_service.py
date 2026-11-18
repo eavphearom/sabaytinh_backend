@@ -456,6 +456,8 @@ class PaymentStateService:
             success = self.dispatch_paid_notification(id)
             delivered += bool(success)
             scope = active_execution.get()
+            if scope:
+                scope.notifications_delivered = delivered
             if not success and scope:
                 scope.issues.add("telegram_deferred")
         return delivered

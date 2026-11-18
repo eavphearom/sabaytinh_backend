@@ -1,4 +1,3 @@
-from app.workers.execution_scope import external_timeouts, read_response
 """PayWay sandbox protocol, verified against official API specifications.
 
 https://developer.payway.com.kh/qr-api-14530840e0.md
@@ -26,6 +25,7 @@ from urllib.parse import urlsplit
 
 from app.services.payments.payment_strategy import GatewayError, GatewayResult
 from app.utils.date_util import DateUtil
+from app.workers.execution_scope import external_timeouts, read_response, WorkerStopped, active_execution, set_stage
 
 
 logger = logging.getLogger(__name__)
@@ -66,9 +66,20 @@ def diagnostic_operation(operation):
         def wrapped(*args, **kwargs):
             try:
                 return method(*args, **kwargs)
+            except WorkerStopped as exc:
+                scope = active_execution.get()
+                logger.warning("PayWay operation=%s worker_abort=%s diagnostics=%s", operation,
+                               exc.reason, scope.diagnostics() if scope else {})
+                raise
             except Exception as exc:
                 reason = reasons.get(str(exc), "configuration_or_unclassified_failure") if isinstance(exc, GatewayError) else "unclassified_failure"
                 logger.warning("PayWay operation=%s validation_failure=%s", operation, reason)
+                if not isinstance(exc, GatewayError):
+                    kind = {TypeError: "type_error", AttributeError: "attribute_error",
+                            ValueError: "value_error"}.get(type(exc), "unexpected_client_error")
+                    scope = active_execution.get()
+                    logger.warning("PayWay operation=%s operational_failure=%s diagnostics=%s",
+                                   operation, kind, scope.diagnostics() if scope else {})
                 raise
         return wrapped
     return decorate
@@ -173,6 +184,7 @@ class PayWayClient:
         ).digest()).decode()
 
     def _post(self, path, payload):
+        set_stage("gateway_admission")
         # Decimal numbers retain the same lexical representation used in signing.
         body = "{" + ",".join(json.dumps(k) + ":" + (
             format(v, "f") if isinstance(v, Decimal) else json.dumps(v)
@@ -185,11 +197,16 @@ class PayWayClient:
         )
         operation = {self.QR_PATH: "initialize", self.CHECK_PATH: "verify", self.CLOSE_PATH: "close"}.get(path, "unknown")
         try:
+            set_stage("gateway_connect")
             connection.connect()
             connection.sock.settimeout(read_timeout)
+            set_stage("gateway_request")
             connection.request("POST", path, body.encode(), {"Content-Type": "application/json"})
+            set_stage("gateway_headers")
             response = connection.getresponse()
+            set_stage("gateway_body")
             raw = read_response(response, connection, 2_000_001, read_timeout)
+            set_stage("gateway_validation")
             if len(raw) > 2_000_000:
                 response_diagnostic(operation, response.status, None)
                 raise GatewayError("Gateway request failed")
@@ -204,7 +221,12 @@ class PayWayClient:
             if not isinstance(result, dict):
                 raise GatewayError("Malformed gateway response")
             return result
-        except (OSError, http.client.HTTPException, ValueError):
+        except (OSError, http.client.HTTPException, ValueError) as exc:
+            failure = "timeout" if isinstance(exc, TimeoutError) else (
+                "invalid_json" if isinstance(exc, ValueError) else "transport_error")
+            scope = active_execution.get()
+            logger.warning("PayWay operation=%s transport_failure=%s diagnostics=%s",
+                           operation, failure, scope.diagnostics() if scope else {})
             raise GatewayError("Gateway unavailable or returned invalid JSON") from None
         finally:
             connection.close()
