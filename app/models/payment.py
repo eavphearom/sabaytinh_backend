@@ -14,6 +14,7 @@ from sqlalchemy import (
     PrimaryKeyConstraint,
     String,
     Text,
+    UniqueConstraint,
     text,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -135,6 +136,17 @@ class Payment(AuditSoftDeleteMixin, db.Model):
         nullable=True,
     )
 
+    qr_image: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+
+    replaces_payment_id: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("payments.id", name="fk_payments_replaces"), nullable=True,
+    )
+    close_accepted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=False))
+    closure_verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=False))
+
     abapay_deeplink: Mapped[str | None] = mapped_column(
         Text,
         nullable=True,
@@ -185,6 +197,7 @@ class Payment(AuditSoftDeleteMixin, db.Model):
     )
 
     __table_args__ = (
+        UniqueConstraint("replaces_payment_id", name="uq_payments_replaces"),
         PrimaryKeyConstraint('id', name="payments_pkey"),
         CheckConstraint(
             'amount >= 0::numeric',

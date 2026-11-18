@@ -63,7 +63,7 @@ class PaymentServicePostgresTests(unittest.TestCase):
     def payment(self):
         return db.session.get(Payment, self.payment_id, populate_existing=True)
 
-    def test_initialize_persists_qr_but_not_image_or_secrets(self):
+    def test_initialize_persists_official_image_across_sessions(self):
         response = PaymentService().initialize(self.payment_id)
         self.assertEqual(response["qr_image"], "data:image/png;base64,dGVzdA==")
         self.assertEqual(response["payment_status"], "PENDING")
@@ -71,7 +71,10 @@ class PaymentServicePostgresTests(unittest.TestCase):
         payment = self.payment()
         self.assertEqual(payment.qr_string, "test-qr")
         self.assertEqual(len(payment.transaction_id), 20)
-        self.assertNotIn("qr_image", Payment.__table__.columns)
+        db.session.remove()
+        self.assertEqual(self.payment().qr_image, response["qr_image"])
+        db.session.rollback()
+        self.assertEqual(PaymentService().verify(self.payment_id)["qr_image"], response["qr_image"])
         with self.assertRaises(BadRequestException):
             PaymentService().initialize(self.payment_id)
 

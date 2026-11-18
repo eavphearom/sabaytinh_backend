@@ -9,9 +9,18 @@ from app.services.payments.payway_client import PayWayClient
 def require_public_payment_ready():
     """Explicit operator attestations, never toggled by application code/tests."""
     config = current_app.config
-    for key in ("PAYWAY_PUBLIC_API_ENABLED", "PAYWAY_CALLBACK_APPROVED", "PAYWAY_SANDBOX_VERIFIED", "PAYWAY_WORKER_VERIFIED"):
+    for key in ("PAYWAY_PUBLIC_API_ENABLED", "PAYWAY_SANDBOX_VERIFIED", "PAYWAY_WORKER_VERIFIED"):
         if config.get(key) is not True:
             raise PaymentGatewayUnavailableException("Public sandbox payments are not enabled")
+    PayWayClient(config, require_callback=False).ensure_configured()
+
+
+def require_callback_ready():
+    """Callback authentication remains independently opt-in and fail-closed."""
+    require_public_payment_ready()
+    config = current_app.config
+    if config.get("PAYWAY_CALLBACK_APPROVED") is not True:
+        raise PaymentGatewayUnavailableException("PayWay callbacks are not enabled")
     PayWayClient(config).ensure_configured()
     secret = config.get("PAYWAY_CALLBACK_SECRET")
     if not isinstance(secret, str) or not secret.strip():

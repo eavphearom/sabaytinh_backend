@@ -4,14 +4,14 @@ from app.exceptions.api_exception import BadRequestException, ResourceNotFoundEx
 from app.extensions import db
 from app.models import Order, Payment, Invoice, OrderStatusHistory
 from app.repositories.order_repository import OrderRepository
-from app.repositories.payment_repository import PaymentRepository
 from app.repositories.order_status_history_repository import OrderStatusHistoryRepository
 from app.schemas.order_schema import (
     OrderResponseSchema, OrderPaginationResponseSchema, OrderHistoryResponseSchema,
-    AccountOverviewResponseSchema, CheckoutRequestSchema,
+    AccountOverviewResponseSchema, CheckoutRequestSchema, PaymentResponseSchema,
 )
 from app.services.checkout_service import CheckoutService
 from app.services.payments.payment_service import PaymentService
+from app.services.payments.payment_state_service import PaymentStateService
 from app.services.payments.payment_strategy import GatewayError
 from app.services.payments.public_payment_gate import require_public_payment_ready
 from app.utils.date_util import DateUtil
@@ -91,17 +91,91 @@ class OrderService:
 
     def _payment_for(self, order_id, customer_id=None):
         order = self._get(order_id, customer_id)
-        payments = PaymentRepository().find_by_order_id(order.id)
-        if len(payments) != 1:
-            raise BadRequestException("Order requires payment review")
-        return order, payments[0].id
+        payments = db.session.scalars(select(Payment).where(Payment.order_id == order.id)
+            .order_by(Payment.id)).all()
+        return order, PaymentStateService.current_attempt(order, payments).id
 
     def check_payment(self, order_id, customer_id):
         _, payment_id = self._payment_for(order_id, customer_id)
         require_public_payment_ready()
         return PaymentService().verify(payment_id)
 
-    def cancel(self, order_id, actor_id, reason, admin=False):
+    def resume_payment(self, order_id, customer_id):
+        self._validate_id(order_id)
+        require_public_payment_ready()
+        payment, operation = self._resume_snapshot(order_id, customer_id)
+        if operation:
+            try:
+                # The snapshot releases all locks before existing leased gateway I/O.
+                service = PaymentService()
+                if operation == "renew":
+                    service.renew(payment["id"], customer_id)
+                else:
+                    service.verify(payment["id"])
+            except (GatewayError, BadRequestException):
+                # Uncertainty and competing gateway leases retain the same attempt.
+                pass
+            payment, _ = self._resume_snapshot(order_id, customer_id)
+        return {"order_id": order_id, "payment": payment}
+
+    def _resume_snapshot(self, order_id, customer_id):
+        if db.session.new or db.session.dirty or db.session.deleted:
+            raise RuntimeError("Resume requires a session without pending writes")
+        try:
+            order = db.session.scalar(select(Order).where(
+                Order.id == order_id, Order.customer_id == customer_id,
+                Order.is_deleted.is_(False),
+            ).with_for_update().execution_options(populate_existing=True))
+            if order is None:
+                raise ResourceNotFoundException("Order not found")
+            if order.order_status == "CANCELLED":
+                raise BadRequestException("Cancelled orders cannot resume payment")
+            payment, invoice = self._financial_records(order)
+            if (payment.payment_method != "ONLINE" or payment.currency != "USD"
+                    or payment.amount != order.total_amount
+                    or payment.amount != invoice.total_amount
+                    or payment.currency != order.currency or payment.currency != invoice.currency
+                    or payment.payment_status != order.payment_status
+                    or payment.payment_status != invoice.payment_status):
+                raise BadRequestException("Order requires payment review")
+            data = PaymentResponseSchema().dump(payment)
+            if payment.payment_status == "PAID":
+                self._require_verified_paid(order, payment, invoice)
+                data["checkout_status"] = "PAID"
+                return self._without_qr(data), False
+            if order.order_status != "PENDING" or payment.payment_status != "PENDING":
+                raise BadRequestException("Order cannot resume payment")
+            now = DateUtil.now()
+            busy = bool(payment.gateway_lease_until and payment.gateway_lease_until > now)
+            usable = (payment.gateway_state in ("READY", "RECONCILE_REQUIRED")
+                      and payment.close_accepted_at is None
+                      and payment.transaction_id and payment.qr_string
+                      and payment.expires_at and payment.expires_at > now and not busy)
+            if usable:
+                data["checkout_status"] = "READY"
+                data["checkout_message"] = "Continue payment using the existing QR."
+                return data, False
+            data = self._without_qr(data)
+            data["checkout_status"] = "RECONCILIATION_REQUIRED"
+            data["checkout_message"] = (
+                "Payment verification is in progress. Please check again shortly." if busy else
+                "Gateway closure or payment verification is unresolved. Your order remains reserved. "
+                "Please try checking again later or contact support; a replacement QR is unavailable."
+            )
+            operation = None
+            if payment.transaction_id and not busy:
+                operation = "renew" if payment.qr_string and payment.expires_at and payment.expires_at <= now else "verify"
+            return data, operation
+        finally:
+            db.session.rollback()
+
+    @staticmethod
+    def _without_qr(data):
+        for key in ("qr_string", "qr_image", "abapay_deeplink", "checkout_qr_url", "expires_at"):
+            data.pop(key, None)
+        return data
+
+    def cancel(self, order_id, actor_id, reason=None, admin=False):
         order, payment_id = self._payment_for(order_id, None if admin else actor_id)
         if order.order_status == "CANCELLED":
             return self.get_detail(order_id, None if admin else actor_id)
@@ -121,9 +195,9 @@ class OrderService:
             .order_by(Payment.id).with_for_update().execution_options(populate_existing=True)).all()
         invoice = db.session.scalar(select(Invoice).where(Invoice.order_id == order.id,
             Invoice.is_deleted.is_(False)).with_for_update().execution_options(populate_existing=True))
-        if len(payments) != 1 or payments[0].is_deleted or invoice is None:
+        if invoice is None:
             raise BadRequestException("Order requires payment review")
-        return payments[0], invoice
+        return PaymentStateService.current_attempt(order, payments), invoice
 
     @staticmethod
     def _require_verified_paid(order, payment, invoice):

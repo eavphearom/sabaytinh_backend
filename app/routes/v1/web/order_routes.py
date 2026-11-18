@@ -49,12 +49,24 @@ def detail(order_id):
 @web_order_bp.patch("/orders/<int:order_id>/cancel")
 @customer_required
 def cancel(order_id):
-    data = OrderCancelRequestSchema().load(json_payload())
+    data = OrderCancelRequestSchema().load(json_payload(
+        allow_empty=True, example='{"reason": "Changed my mind"}'))
     return ApiResponse.success(data=OrderService().cancel(order_id, g.customer_id, data["reason"]),
                                message="Order cancelled")
 
 
-@web_order_bp.get("/orders/<int:order_id>/payment/check")
+@web_order_bp.route(
+    "/orders/<int:order_id>/payment/check",
+    methods=["GET", "POST"]
+)
 @customer_required
 def check_payment(order_id):
-    return ApiResponse.success(data=OrderService().check_payment(order_id, g.customer_id))
+    return ApiResponse.success(
+        data=OrderService().check_payment(order_id, g.customer_id)
+    )
+
+
+@web_order_bp.post("/orders/<int:order_id>/payment/resume")
+@customer_required
+def resume_payment(order_id):
+    return ApiResponse.success(data=OrderService().resume_payment(order_id, g.customer_id))

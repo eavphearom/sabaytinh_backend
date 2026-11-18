@@ -1,7 +1,7 @@
+from app.common.filters import pagination_params
 from flask import Blueprint, request
 
 from app.common.api_response import ApiResponse
-from app.exceptions.api_exception import BadRequestException
 from app.services.delivery_method_service import (
     DeliveryMethodService,
 )
@@ -16,23 +16,7 @@ web_delivery_method_bp = Blueprint(
 
 @web_delivery_method_bp.get("")
 def list_active_delivery_methods():
-    try:
-        page = int(
-            request.args.get("page_no", 1)
-        )
-        size = int(
-            request.args.get("page_size", 100)
-        )
-
-    except (TypeError, ValueError):
-        raise BadRequestException(
-            "Invalid pagination parameters"
-        )
-
-    if page < 1 or not (1 <= size <= 100):
-        raise BadRequestException(
-            "Invalid pagination parameters"
-        )
+    page, size = pagination_params(request.args, default_size=100, size_aliases=("page_size",))
 
     result = DeliveryMethodService().get_paginated(
         page,

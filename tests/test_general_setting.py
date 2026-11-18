@@ -120,8 +120,19 @@ class GeneralSettingPostgresTests(unittest.TestCase):
         self.assertEqual(set(data), {"deliveries", "payment-methods"})
         self.assertEqual(data["payment-methods"], [{"value": "ONLINE", "label": "Online Payment"}])
         self.assertEqual([x["id"] for x in data["deliveries"]], [10, 11, 1])
-        self.assertEqual(data["deliveries"][0], {"id": 10, "name": "Alpha", "fee": 2.12345, "currency": "KHR"})
+        self.assertEqual(data["deliveries"][0], {"id": 10, "name": "Alpha", "fee": 2.12345, "currency": "KHR", "image": None})
         self.assertIsInstance(data["deliveries"][0]["fee"], (int, float))
+
+    def test_delivery_images_use_existing_logo_urls(self):
+        db.session.get(DeliveryMethod, 10).logo = "/uploads/delivery_methods/test.png"
+        db.session.get(DeliveryMethod, 11).logo = "https://example.test/delivery.png"
+        db.session.commit()
+        response = self.web("form/order")
+        self.assertEqual(response.status_code, 200)
+        deliveries = response.json["data"]["deliveries"]
+        self.assertEqual(deliveries[0]["image"], "http://localhost/uploads/delivery_methods/test.png")
+        self.assertEqual(deliveries[1]["image"], "https://example.test/delivery.png")
+        self.assertIsNone(deliveries[2]["image"])
 
     def test_empty_entity_results_preserve_enums(self):
         for model in MODELS:

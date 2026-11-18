@@ -126,6 +126,12 @@ class CheckoutService:
             subtotal = self._money(sum((item.subtotal for item in snapshots), Decimal("0")))
             shipping_fee = self._money(delivery.fee)
             total = self._money(subtotal + shipping_fee)
+            expected_total = self._money(data["expected_total_amount"])
+
+            if expected_total != total:
+                raise BadRequestException(
+                    "Checkout total has changed. Please refresh and try again."
+                )
             money = dict(subtotal=subtotal, shipping_fee=shipping_fee,
                          discount_amount=Decimal("0.00"), total_amount=total,
                          currency=Currency.USD.value)

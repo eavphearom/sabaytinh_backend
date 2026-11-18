@@ -13,6 +13,8 @@ class Config:
 
     SQLALCHEMY_ENGINE_OPTIONS = {
         "pool_pre_ping": True,
+        # Keep QR data and other bound values out of SQL logs and exceptions.
+        "hide_parameters": True,
     }
 
     SECRET_KEY = os.getenv("SECRET_KEY")

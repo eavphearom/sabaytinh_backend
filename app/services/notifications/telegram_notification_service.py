@@ -1,4 +1,5 @@
 """Telegram delivery for the payment service's committed, verified events."""
+import html
 import http.client
 import json
 import re
@@ -24,12 +25,12 @@ class NotificationDeliveryError(Exception):
 class TelegramNotificationService:
     @staticmethod
     def _text(value, limit=200):
-        # Plain text (no parse_mode/entities); collapse user-controlled newlines
-        # so a product or address cannot impersonate another message field.
         value = getattr(value, "value", value)
         text = " ".join(str(value or "").split())
         text = "".join(c for c in text if c.isprintable())
-        return text if len(text) <= limit else text[:limit - 1] + "…"
+        if len(text) > limit:
+            text = text[:limit - 1] + "…"
+        return html.escape(text, quote=False)
 
     def notify_verified_payment(self, event):
         """Only called by the leased dispatcher, after its transaction commits."""
@@ -59,33 +60,71 @@ class TelegramNotificationService:
                 raise NotificationDeliveryError("Order is not eligible for a purchase notification")
             customer = order.customer
             name = customer.username if customer and not customer.is_deleted else order.recipient_name
-            lines = ["Payment verified", f"Order: {self._text(order.order_code)}",
-                     f"Customer: {self._text(name)}",
-                     f"Total: {order.total_amount:.2f} {self._text(order.currency)}",
-                     f"Payment: {self._text(payment.payment_method)} / PAID",
-                     f"Recipient: {self._text(order.recipient_name)}",
-                     f"Phone: {self._text(order.recipient_phone)}",
-                     f"Address: {self._text(order.delivery_address, 500)}",
-                     f"Event: {event['event_id']}", "Products:"]
-            # One bounded message avoids partial multi-message delivery. Budget
-            # in UTF-16 units conservatively, including non-BMP product names.
-            items = sorted(order.items, key=lambda item: item.id)
-            for index, item in enumerate(items):
-                line = f"- {self._text(item.product_name, 120)} x {item.quantity}"
-                if len(("\n".join(lines + [line])).encode("utf-16-le")) // 2 > 3900:
-                    lines.append(f"… {len(items) - index} more order lines; view order for details")
-                    break
-                lines.append(line)
+            currency = getattr(order.currency, "value", order.currency)
+            def money(amount):
+                return f"${amount:.2f}" if currency == "USD" else f"{amount:.2f} {self._text(currency)}"
+
+            lines = ["🛒 <b>PAYMENT RECEIVED</b>", "",
+                     f"🧾 Order: #{self._text(order.order_code)}",
+                     f"🕒 Order at: {DateUtil.format(order.created_at)}", "",
+                     f"👤 Customer: {self._text(name)}",
+                     f"📞 Phone: {self._text(order.recipient_phone)}", "", "📦 <b>Items:</b>"]
+            for item in sorted(order.items, key=lambda item: item.id):
+                lines.extend([
+                    f"• {self._text(item.product_name, 255)}",
+                    f"  👟 Size: {self._text(item.size_name) or '—'}",
+                    f"  🎨 Color: {self._text(item.color_name) or '—'}",
+                    f"  🔢 Qty: {item.quantity}",
+                    f"  💵 Price: {money(item.unit_price)}", "",
+                ])
+            lines.extend([
+                f"💳 Payment: {self._text(payment.payment_method.label)}",
+                f"⏳ Payment Status: {self._text(payment.payment_status)}", "",
+                f"🚚 Delivery: {self._text(order.delivery_method_name)}",
+            ])
+            # Escape each address line while retaining its original line breaks.
+            address = (order.delivery_address or "").splitlines() or [""]
+            lines.append("📍 Address: " + self._text(address[0], 500))
+            lines.extend(self._text(line, 500) for line in address[1:])
+            lines.extend(["", f"💰 Total: {money(order.total_amount)}",
+                          f"📋 Order Status: {self._text(order.order_status)}",
+                          f"Event: {event['event_id']}"])
             return "\n".join(lines)
         finally:
             db.session.rollback()  # No database transaction during HTTPS.
 
+    @staticmethod
+    def _message_parts(text):
+        # Split on complete HTML lines so tags/entities are never cut. Each
+        # formatted field is bounded above; conservative UTF-16 sizing includes tags.
+        parts = []
+        lines = []
+        for line in text.split("\n"):
+            if len(line.encode("utf-16-le")) // 2 > 3900:
+                raise NotificationDeliveryError("Notification line exceeds message limit")
+            candidate = "\n".join(lines + [line])
+            if len(candidate.encode("utf-16-le")) // 2 > 3900:
+                parts.append("\n".join(lines))
+                lines = []
+            lines.append(line)
+        if lines:
+            parts.append("\n".join(lines))
+        return parts
+
     def _send(self, text):
+        # The existing event is acknowledged only after every part succeeds.
+        # A retry after partial delivery may repeat parts (at-least-once delivery).
+        message_id = None
+        for part in self._message_parts(text):
+            message_id = self._send_message(part)
+        return message_id
+
+    def _send_message(self, text):
         token = current_app.config.get("TELEGRAM_BOT_TOKEN") or ""
         chat = str(current_app.config.get("TELEGRAM_CHAT_ID") or "").strip()
         if not re.fullmatch(r"[0-9]+:[A-Za-z0-9_-]+", token) or not chat:
             raise NotificationDeliveryError("Telegram credentials are missing or invalid")
-        payload = json.dumps({"chat_id": chat, "text": text,
+        payload = json.dumps({"chat_id": chat, "text": text, "parse_mode": "HTML",
                               "link_preview_options": {"is_disabled": True}}, ensure_ascii=False).encode("utf-8")
         connection = None
         try:

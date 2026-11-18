@@ -19,6 +19,7 @@ class PaymentContext:
     amount: Decimal
     currency: str
     lease_token: str
+    close_accepted: bool = False
 
 
 @dataclass(frozen=True)

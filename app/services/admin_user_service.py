@@ -1,3 +1,4 @@
+from app.common.filters import pagination_params
 from app.exceptions.api_exception import BadRequestException
 from app.repositories.user_repository import UserRepository
 from app.schemas.admin_user_schema import AdminUserResponseSchema
@@ -5,18 +6,10 @@ from app.schemas.admin_user_schema import AdminUserResponseSchema
 
 class AdminUserService:
     def get_paginated(self, params):
-        allowed = {"page", "size", "page_no", "per_page", "search", "role_id"}
+        allowed = {"pageNo", "perPage", "page", "size", "page_no", "per_page", "search", "role_id"}
         if any(key not in allowed or len(params.getlist(key)) != 1 for key in params):
             raise BadRequestException("Unsupported or repeated user filter")
-        if ("page" in params and "page_no" in params) or ("size" in params and "per_page" in params):
-            raise BadRequestException("Use only one name for each pagination parameter")
-        try:
-            page = int(params.get("page", params.get("page_no", "1")))
-            size = int(params.get("size", params.get("per_page", "10")))
-        except (ValueError, TypeError):
-            raise BadRequestException("Page and size must be integers") from None
-        if page < 1 or not 1 <= size <= 100 or (page - 1) * size > 9_223_372_036_854_775_807:
-            raise BadRequestException("Page must be positive and size must be between 1 and 100")
+        page, size = pagination_params(params, page_aliases=("page",), size_aliases=("size",))
         repository = UserRepository()
         role_id = None
         if "role_id" in params:

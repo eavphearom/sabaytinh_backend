@@ -1,4 +1,5 @@
 from marshmallow import Schema, fields
+from app.utils.file_util import FileUtil
 
 
 class SettingOptionSchema(Schema):
@@ -15,3 +16,7 @@ class SettingDeliverySchema(SettingOptionSchema):
     # Do not round the stored fee or change checkout's Decimal calculation.
     fee = fields.Float()
     currency = fields.String()
+    image = fields.Method("image_url")
+
+    def image_url(self, obj):
+        return FileUtil.get_image_url(obj.logo)

@@ -50,9 +50,44 @@ class PaymentService:
     def verify(self, payment_id):
         return self._run(payment_id, "verify")
 
-    def cancel(self, payment_id, authenticated_customer_id, reason, *, actor_id=None):
-        if not isinstance(reason, str) or not reason.strip() or len(reason) > 255:
-            raise BadRequestException("A cancellation reason of 1-255 characters is required")
+    def renew(self, payment_id, customer_id):
+        strategy = PaymentStrategyFactory.resolve("ONLINE")
+        context = self.state.claim(payment_id, "renew", customer_id)
+        if context is None:
+            return self.state.response(payment_id)
+        try:
+            if db.session().in_transaction():
+                raise RuntimeError("Gateway I/O must not run inside a DB transaction")
+            result = strategy.verify(context)
+            self.state._evidence(context, result)
+            if result.status == "APPROVED":
+                return self.state.apply(context, result, "verify")
+            if result.status not in ("PENDING", "CANCELLED", "DECLINED") or result.reference:
+                raise GatewayError("Unsupported gateway state for renewal")
+            if not context.close_accepted:
+                self.state.record_close_acceptance(context, strategy.close(context))
+                # Close's matching success is the non-payability evidence.
+                # Check again to detect approval racing Close; PENDING does not
+                # undo the documented Close guarantee. Never skip this check.
+                result = strategy.verify(context)
+                self.state._evidence(context, result)
+            if result.status not in ("PENDING", "CANCELLED"):
+                return self.state.apply(context, result, "verify")
+            new_context = self.state.replace_closed_attempt(context, result, customer_id)
+        except Exception:
+            self.state.mark_uncertain(context)
+            raise
+        try:
+            return self.state.apply(new_context, strategy.initialize(new_context), "initialize")
+        except Exception:
+            self.state.mark_uncertain(new_context)
+            raise
+
+    def cancel(self, payment_id, authenticated_customer_id, reason=None, *, actor_id=None):
+        if reason is not None and (not isinstance(reason, str) or len(reason) > 255):
+            raise BadRequestException("Cancellation reason must be a string of at most 255 characters")
+        if reason is not None:
+            reason = reason.strip() or None
         return self._run(payment_id, "cancel", authenticated_customer_id, reason, actor_id)
 
     def callback_hint(self, transaction_id):

@@ -16,7 +16,7 @@ from app.common.api_response import ApiResponse
 from app.exceptions.api_exception import BadRequestException
 from app.services.payments.payway_callback_security import MAX_BODY_BYTES, SIGNATURE_HEADER, verify_callback
 from app.services.payments.payment_service import PaymentService
-from app.services.payments.public_payment_gate import require_public_payment_ready
+from app.services.payments.public_payment_gate import require_callback_ready
 
 
 def register_payway_callback(app):
@@ -34,7 +34,7 @@ def register_payway_callback(app):
     lock = Lock()
 
     def callback():
-        require_public_payment_ready()
+        require_callback_ready()
         # Bounded, per-worker protection; deployments also need a shared proxy
         # rate limit. No X-Forwarded-For trust or unbounded per-IP map.
         with lock:

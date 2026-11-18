@@ -28,7 +28,7 @@ def overview():
 @web_account_bp.get("/orders")
 @customer_required
 def orders():
-    allowed = {"page_no", "per_page", "search", "status", "sort_by", "sort_dir"}
+    allowed = {"pageNo", "perPage", "page_no", "per_page", "search", "status", "sort_by", "sort_dir"}
     if set(request.args) - allowed or any(len(request.args.getlist(key)) != 1 for key in request.args):
         raise BadRequestException("Unknown or repeated account order filter")
     filters = BaseFilter.from_request()

@@ -1,3 +1,4 @@
+from app.common.filters import pagination_params
 from flask import Blueprint, request
 from flask_jwt_extended import get_jwt_identity
 from marshmallow import ValidationError
@@ -21,30 +22,7 @@ admin_delivery_method_bp = Blueprint(
 
 
 def _params():
-    try:
-        page = int(
-            request.args.get(
-                "page_no",
-                request.args.get("pageNo", 1)
-            )
-        )
-
-        size = int(
-            request.args.get(
-                "page_size",
-                request.args.get("pageSize", 10)
-            )
-        )
-
-    except (ValueError, TypeError):
-        raise BadRequestException(
-            "Invalid pagination parameters"
-        )
-
-    if page < 1 or size < 1 or size > 100:
-        raise BadRequestException(
-            "page_no must be >= 1 and page_size must be 1-100"
-        )
+    page, size = pagination_params(request.args, size_aliases=("page_size", "pageSize"))
 
     return (
         page,

@@ -61,9 +61,11 @@ def run_sandbox_smoke(client, context):
         try:
             result = client.initialize(context)
             initialized = _matches(result, context) and result.status == "READY"
+            print("Sandbox initialize=" + ("READY_CONFIRMED" if initialized else "UNCONFIRMED"), file=sys.stderr, flush=True)
         except Exception:
             # Do not expose exceptions, raw responses, credentials or QR data.
             initialized = False
+            print("Sandbox initialize=FAILED_OR_UNCONFIRMED", file=sys.stderr, flush=True)
     finally:
         if may_exist:
             outcome = _cleanup_transaction(client, context)

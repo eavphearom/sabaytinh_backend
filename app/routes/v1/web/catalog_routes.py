@@ -15,7 +15,7 @@ def products():
     filters = BaseFilter.from_request()
     schema = HomeProductFilterSchema()
     params = schema.load({key: request.args[key] for key in schema.fields if key in request.args})
-    if params.get("type") == "new" and "per_page" not in request.args:
+    if params.get("type") == "new" and not {"perPage", "per_page"}.intersection(request.args):
         filters.per_page = 15
     if (filters.page_no - 1) * filters.per_page > 9223372036854775807:
         raise BadRequestException("Requested page offset is too large")

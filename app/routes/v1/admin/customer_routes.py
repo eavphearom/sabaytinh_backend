@@ -20,7 +20,7 @@ def no_store(response):
 @admin_customer_bp.get("")
 @admin_required
 def list_customers():
-    if any(key not in {"page_no", "per_page", "search"} or len(request.args.getlist(key)) != 1 for key in request.args):
+    if any(key not in {"pageNo", "perPage", "page_no", "per_page", "search"} or len(request.args.getlist(key)) != 1 for key in request.args):
         raise BadRequestException("Unsupported or repeated customer filter")
     return paginated(CustomerService().get_paginated(BaseFilter.from_request()))
 

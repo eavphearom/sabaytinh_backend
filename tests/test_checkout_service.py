@@ -102,6 +102,7 @@ class CheckoutServicePostgresTests(unittest.TestCase):
 
     def payload(self, quantity=2):
         return dict(delivery_method_id=1, recipient_name="Sok Dara", recipient_phone="012345678",
+                    expected_total_amount=str(Decimal("10.13") * (quantity if type(quantity) is int else 2) + Decimal("1.24")),
                     delivery_address="Phnom Penh", note="Call me", payment_method="ONLINE",
                     items=[dict(variant_stock_id=1, quantity=quantity)])
 

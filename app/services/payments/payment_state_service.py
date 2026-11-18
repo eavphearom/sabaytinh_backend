@@ -33,6 +33,50 @@ class PaymentStateService:
             raise RuntimeError("Payment orchestration requires no pending unrelated writes")
 
     @staticmethod
+    def attempts(order_id):
+        return db.session.scalars(select(Payment).where(Payment.order_id == order_id)
+            .order_by(Payment.id).with_for_update().execution_options(populate_existing=True)).all()
+
+    @staticmethod
+    def current_attempt(order, attempts):
+        """Only an intact chain of conclusively closed predecessors may be paid."""
+        if not attempts or any(p.is_deleted for p in attempts):
+            raise BadRequestException("Order requires payment review")
+        for index, payment in enumerate(attempts):
+            previous_id = attempts[index - 1].id if index else None
+            if (payment.replaces_payment_id != previous_id or payment.amount != order.total_amount
+                    or payment.currency != order.currency or payment.payment_method != "ONLINE"):
+                raise BadRequestException("Order requires payment review")
+            if index < len(attempts) - 1 and (
+                payment.payment_status != "CANCELLED" or not payment.close_accepted_at
+                or not payment.closure_verified_at or payment.payment_reference or payment.paid_at
+            ):
+                raise BadRequestException("An earlier payment requires review; another QR is unavailable")
+        return attempts[-1]
+
+    @staticmethod
+    def _consistent(order, payment, invoice):
+        if (payment.amount != order.total_amount or payment.amount != invoice.total_amount
+                or payment.currency != order.currency or payment.currency != invoice.currency
+                or order.payment_status != invoice.payment_status):
+            raise BadRequestException("Inconsistent financial records")
+        if payment.payment_status != order.payment_status:
+            # Historical attempts must remain verifiable after another attempt
+            # settles. Their own amount, currency and gateway evidence still apply.
+            multiple = db.session.scalar(select(Payment.id).where(
+                Payment.order_id == order.id, Payment.id != payment.id).limit(1)) is not None
+            if not multiple or not (payment.close_accepted_at or order.payment_status == "PAID"):
+                raise BadRequestException("Inconsistent financial records")
+
+    @staticmethod
+    def _lease_matches(payment, context):
+        if (payment.gateway_lease_token != context.lease_token
+                or payment.gateway_lease_until is None or payment.gateway_lease_until <= DateUtil.now()
+                or payment.transaction_id != context.transaction_id or payment.amount != context.amount
+                or payment.currency != context.currency):
+            raise BadRequestException("Stale gateway operation; reconciliation required")
+
+    @staticmethod
     def _locked(payment_id):
         order_id = db.session.scalar(select(Payment.order_id).where(
             Payment.id == payment_id, Payment.is_deleted.is_(False),
@@ -44,8 +88,8 @@ class PaymentStateService:
         # deletion, especially late approval for a cancelled order.
         order = db.session.scalar(select(Order).where(Order.id == order_id)
             .with_for_update().execution_options(populate_existing=True))
-        payment = db.session.scalar(select(Payment).where(Payment.id == payment_id,
-            Payment.is_deleted.is_(False)).with_for_update().execution_options(populate_existing=True))
+        attempts = PaymentStateService.attempts(order_id)
+        payment = next((p for p in attempts if p.id == payment_id and not p.is_deleted), None)
         invoice = db.session.scalar(select(Invoice).where(Invoice.order_id == order_id,
             Invoice.is_deleted.is_(False)).with_for_update().execution_options(populate_existing=True))
         if order is None or payment is None or invoice is None:
@@ -60,11 +104,14 @@ class PaymentStateService:
                 raise BadRequestException("Deleted orders cannot start payment operations")
             if payment.payment_method != "ONLINE" or payment.currency != "USD":
                 raise BadRequestException("Only ONLINE USD payments are supported")
-            if (payment.amount != order.total_amount or payment.amount != invoice.total_amount
-                    or invoice.currency != payment.currency or order.currency != payment.currency
-                    or order.payment_status != payment.payment_status
-                    or invoice.payment_status != payment.payment_status):
-                raise BadRequestException("Inconsistent financial records")
+            self._consistent(order, payment, invoice)
+            attempts = self.attempts(order.id)
+            if operation in ("initialize", "renew", "cancel"):
+                if self.current_attempt(order, attempts).id != payment.id:
+                    raise BadRequestException("Payment attempt has been superseded")
+            if operation == "renew":
+                if customer_id != order.customer_id or order.order_status != "PENDING":
+                    raise BadRequestException("Order cannot renew payment")
             if operation == "cancel":
                 if type(customer_id) is not int or customer_id != order.customer_id:
                     raise BadRequestException("Customer does not own this order")
@@ -79,8 +126,17 @@ class PaymentStateService:
             if payment.payment_status not in ("PENDING", "CANCELLED"):
                 raise BadRequestException("Payment requires manual review")
             now = DateUtil.now()
-            if payment.gateway_lease_until and payment.gateway_lease_until > now:
+            if any(p.gateway_lease_until and p.gateway_lease_until > now for p in attempts):
                 raise BadRequestException("Payment operation is already in progress")
+            if operation == "renew":
+                if (payment.payment_status != "PENDING" or order.payment_status != "PENDING"
+                        or not payment.qr_string or not payment.expires_at):
+                    raise BadRequestException("Uncertain initialization requires reconciliation")
+                if payment.expires_at > now:
+                    db.session.rollback()
+                    return None
+                if payment.created_at <= now - timedelta(days=7):
+                    raise BadRequestException("Payment is outside the automated gateway check window")
             if operation == "initialize":
                 if order.order_status != "PENDING" or payment.payment_status != "PENDING":
                     raise BadRequestException("Order cannot initialize payment")
@@ -91,19 +147,14 @@ class PaymentStateService:
                 payment.transaction_id = uuid4().hex[:20]
             elif not payment.transaction_id:
                 raise BadRequestException("Payment has no gateway transaction to verify")
-            if operation == "cancel":
-                # Step 4 creates one attempt. Multiple attempts require closing
-                # every attempt; never infer safety from only one payment.
-                ids = db.session.scalars(select(Payment.id).where(Payment.order_id == order.id)).all()
-                if ids != [payment.id]:
-                    raise BadRequestException("Multiple payment attempts require manual review")
             token = uuid4().hex
             payment.gateway_lease_token = token
             payment.gateway_lease_until = now + timedelta(seconds=current_app.config.get("PAYWAY_LEASE_SECONDS", 90))
             payment.gateway_state = "INITIALIZING" if operation == "initialize" else "VERIFYING"
             payment.next_check_at = payment.gateway_lease_until
             context = PaymentContext(payment.id, order.id, payment.transaction_id,
-                current_app.config["PAYWAY_MERCHANT_ID"], payment.amount, payment.currency, token)
+                current_app.config["PAYWAY_MERCHANT_ID"], payment.amount, payment.currency, token,
+                close_accepted=payment.close_accepted_at is not None)
             db.session.commit()
             return context
         except Exception:
@@ -123,26 +174,32 @@ class PaymentStateService:
         try:
             self._evidence(context, result)
             order, payment, invoice = self._locked(context.payment_id)
-            if (payment.gateway_lease_token != context.lease_token
-                    or payment.gateway_lease_until is None
-                    or payment.gateway_lease_until <= DateUtil.now()):
-                raise BadRequestException("Stale gateway operation; reconciliation required")
-            if (payment.transaction_id != context.transaction_id or payment.amount != context.amount
-                    or payment.currency != context.currency or order.total_amount != payment.amount
-                    or invoice.total_amount != payment.amount
-                    or order.currency != payment.currency or invoice.currency != payment.currency
-                    or order.payment_status != payment.payment_status
-                    or invoice.payment_status != payment.payment_status):
-                raise BadRequestException("Payment changed during gateway operation")
+            self._lease_matches(payment, context)
+            self._consistent(order, payment, invoice)
             now = DateUtil.now()
             if result.status == "APPROVED":
                 if not result.reference:
                     raise GatewayError("Missing verified approval reference")
+                attempts = self.attempts(order.id)
+                review = len(attempts) > 1 and (
+                    payment.id != attempts[-1].id or payment.close_accepted_at
+                    or any(p.id != payment.id and p.payment_status == "PAID" for p in attempts)
+                )
+                if len(attempts) > 1:
+                    try:
+                        self.current_attempt(order, attempts)
+                    except BadRequestException:
+                        # Retain real approval evidence even for a damaged or
+                        # conflicting chain, but never authorize fulfillment.
+                        review = True
                 payment.payment_status = order.payment_status = invoice.payment_status = "PAID"
                 payment.paid_at = payment.paid_at or now
                 invoice.paid_at = invoice.paid_at or now
                 payment.payment_reference = result.reference
-                if order.order_status == "CANCELLED":
+                if review:
+                    payment.gateway_state = "REFUND_REVIEW"
+                    payment.checkout_message = "Approval on conflicting payment attempts; refund review required"
+                elif order.order_status == "CANCELLED":
                     payment.gateway_state = "REFUND_REVIEW_NOTIFY_PENDING"
                     payment.checkout_message = "Payment received after cancellation; refund review required"
                 else:
@@ -150,20 +207,22 @@ class PaymentStateService:
                     payment.checkout_message = "Payment verified"
                 payment.next_check_at = None
             elif result.status == "READY" and operation == "initialize":
-                if order.order_status != "PENDING" or payment.payment_status != "PENDING":
+                if (order.order_status != "PENDING" or payment.payment_status != "PENDING"
+                        or order.payment_status != "PENDING"):
                     raise BadRequestException("Order no longer accepts payment initialization")
                 payment.qr_string = result.qr_string
+                payment.qr_image = result.qr_image
                 payment.abapay_deeplink = result.abapay_deeplink
                 payment.expires_at = result.expires_at
                 payment.gateway_state = "READY"
                 payment.checkout_message = "Awaiting payment"
                 payment.next_check_at = now + timedelta(seconds=30)
             elif result.status == "CLOSED" and operation == "cancel":
-                if order.order_status != "PENDING" or payment.payment_status != "PENDING":
+                if (order.order_status != "PENDING" or payment.payment_status != "PENDING"
+                        or order.payment_status != "PENDING"):
                     raise BadRequestException("Order cannot release inventory")
-                ids = db.session.scalars(select(Payment.id).where(Payment.order_id == order.id)).all()
-                if ids != [payment.id]:
-                    raise BadRequestException("Multiple payment attempts require manual review")
+                if self.current_attempt(order, self.attempts(order.id)).id != payment.id:
+                    raise BadRequestException("Payment attempt has been superseded")
                 # Include original snapshots even if an item was soft-deleted:
                 # checkout deducted every item's quantity.
                 items = db.session.scalars(select(OrderItem).where(OrderItem.order_id == order.id)).all()
@@ -185,7 +244,7 @@ class PaymentStateService:
             elif result.status in ("PENDING", "CANCELLED", "DECLINED"):
                 # Only an explicit successful Close Transaction may release
                 # inventory. Neither QR expiry nor a failed check does so.
-                payment.gateway_state = "RECONCILE_REQUIRED"
+                payment.gateway_state = "RENEWED_CLOSED" if payment.closure_verified_at else "RECONCILE_REQUIRED"
                 payment.checkout_message = "Payment requires reconciliation"
                 payment.next_check_at = now + timedelta(seconds=30)
             else:
@@ -194,8 +253,6 @@ class PaymentStateService:
             payment.gateway_lease_until = None
             payment.updated_at = order.updated_at = invoice.updated_at = now
             response = PaymentResponseSchema().dump(payment)
-            if result.qr_image is not None:
-                response["qr_image"] = result.qr_image  # Never persisted.
             db.session.commit()
         except Exception:
             db.session.rollback()
@@ -220,6 +277,76 @@ class PaymentStateService:
             db.session.rollback()
             raise
 
+    def record_close_acceptance(self, context, result):
+        """Persist Close acknowledgement separately from final cancellation."""
+        self._clean_session()
+        try:
+            self._evidence(context, result)
+            if result.status != "CLOSED":
+                raise GatewayError("Gateway closure is unconfirmed")
+            order, payment, invoice = self._locked(context.payment_id)
+            self._lease_matches(payment, context)
+            self._consistent(order, payment, invoice)
+            payment.close_accepted_at = payment.close_accepted_at or DateUtil.now()
+            payment.updated_at = DateUtil.now()
+            db.session.commit()
+        except Exception:
+            db.session.rollback()
+            raise
+
+    def replace_closed_attempt(self, context, result, customer_id):
+        """Atomically archive the old attempt and claim one new initialization.
+
+        A new transaction ID and lease are committed before QR network I/O. A
+        crash after this commit is reconciled against that ID, never reinitialized.
+        """
+        self._clean_session()
+        try:
+            self._evidence(context, result)
+            order, payment, invoice = self._locked(context.payment_id)
+            self._lease_matches(payment, context)
+            self._consistent(order, payment, invoice)
+            # PENDING alone proves nothing. Only the persisted, matching Close
+            # success plus fresh verified non-approved evidence permits renewal.
+            if (result.status not in ("PENDING", "CANCELLED") or result.reference
+                    or not payment.close_accepted_at
+                    or payment.paid_at or payment.payment_reference
+                    or order.is_deleted or order.customer_id != customer_id
+                    or order.order_status != "PENDING" or order.payment_status != "PENDING"
+                    or payment.payment_status != "PENDING"
+                    or self.current_attempt(order, self.attempts(order.id)).id != payment.id):
+                raise BadRequestException("Payment renewal requires confirmed closure")
+            now = DateUtil.now()
+            payment.closure_verified_at = now
+            payment.payment_status = "CANCELLED"
+            payment.gateway_state = "RENEWED_CLOSED"
+            payment.cancellation_reason = "QR renewal: Close confirmed; post-close check " + result.status
+            payment.checkout_message = "Close confirmed; post-close check " + result.status + "; replaced by a new payment attempt"
+            payment.gateway_lease_token = payment.gateway_lease_until = None
+            payment.next_check_at = now + timedelta(minutes=5)
+            payment.updated_at = now
+            payment.update_uid = customer_id
+            token = uuid4().hex
+            replacement = Payment(
+                order_id=order.id, replaces_payment_id=payment.id,
+                payment_method="ONLINE", payment_status="PENDING",
+                amount=payment.amount, currency=payment.currency,
+                transaction_id=uuid4().hex[:20], gateway_state="INITIALIZING",
+                gateway_lease_token=token,
+                gateway_lease_until=now + timedelta(seconds=current_app.config.get("PAYWAY_LEASE_SECONDS", 90)),
+                create_uid=customer_id,
+            )
+            replacement.next_check_at = replacement.gateway_lease_until
+            db.session.add(replacement)
+            db.session.flush()
+            new_context = PaymentContext(replacement.id, order.id, replacement.transaction_id,
+                context.merchant_id, replacement.amount, replacement.currency, token)
+            db.session.commit()
+            return new_context
+        except Exception:
+            db.session.rollback()
+            raise
+
     def defer_reconciliation(self, payment_id, manual_review=False):
         """Back off an unprocessable due row without changing financial state."""
         self._clean_session()
@@ -228,7 +355,7 @@ class PaymentStateService:
                 Payment.id == payment_id, Payment.is_deleted.is_(False)
             ).with_for_update().execution_options(populate_existing=True))
             now = DateUtil.now()
-            if (payment is not None and payment.payment_status == "PENDING"
+            if (payment is not None and (payment.payment_status == "PENDING" or payment.closure_verified_at)
                     and payment.payment_method == "ONLINE"
                     and payment.next_check_at is not None and payment.next_check_at <= now
                     and (payment.gateway_lease_until is None or payment.gateway_lease_until <= now)):

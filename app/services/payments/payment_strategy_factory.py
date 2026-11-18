@@ -11,6 +11,6 @@ class PaymentStrategyFactory:
     def resolve(method):
         if method != PaymentMethod.ONLINE.value:
             raise BadRequestException("Only ONLINE payments are enabled")
-        client = PayWayClient(current_app.config)
+        client = PayWayClient(current_app.config, require_callback=False)
         client.ensure_configured()
         return PayWayPaymentStrategy(client)

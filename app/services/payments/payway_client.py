@@ -11,10 +11,13 @@ for these APIs. Callback payloads are NOT payment evidence.
 import base64
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
+from enum import Enum
 import hashlib
 import hmac
 import http.client
 import json
+import logging
+from functools import wraps
 import math
 import re
 import ssl
@@ -22,6 +25,86 @@ from urllib.parse import urlsplit
 
 from app.services.payments.payment_strategy import GatewayError, GatewayResult
 from app.utils.date_util import DateUtil
+
+
+logger = logging.getLogger(__name__)
+
+
+CONFIGURATION_FAILURE_REASONS = {
+    "PayWay sandbox is disabled": "sandbox_disabled",
+    "Only the official PayWay sandbox host is allowed": "invalid_sandbox_host",
+    "Sandbox merchant ID is missing or invalid": "invalid_merchant_configuration",
+    "Sandbox API key is required": "api_key_missing",
+    "A public HTTPS callback URL is required": "invalid_callback_url",
+    "Encoded callback URL exceeds gateway limit": "callback_url_too_long",
+    "Invalid gateway timeouts": "invalid_gateway_timeouts",
+    "Lease must cover verification and closure timeouts": "invalid_gateway_lease",
+    "Invalid QR lifetime": "invalid_qr_lifetime",
+}
+
+
+def diagnostic_operation(operation):
+    """Log only local allowlisted reasons, never arbitrary exception text."""
+    reasons = {
+        **CONFIGURATION_FAILURE_REASONS,
+        "Gateway amount mismatch": "amount_mismatch",
+        "Gateway currency mismatch": "currency_mismatch",
+        "Gateway transaction mismatch": "transaction_mismatch",
+        "Gateway rejected request or returned malformed status": "gateway_status_rejected",
+        "Missing transaction details": "missing_transaction_details",
+        "Unsupported or contradictory gateway transaction status": "contradictory_payment_status",
+        "Missing approval reference": "missing_approval_reference",
+        "Missing gateway QR fields": "missing_qr_fields",
+        "Invalid gateway QR format": "invalid_qr_format",
+        "Gateway request failed": "http_or_size_failure",
+        "Malformed gateway response": "invalid_response_shape",
+        "Gateway unavailable or returned invalid JSON": "transport_or_json_failure",
+    }
+    def decorate(method):
+        @wraps(method)
+        def wrapped(*args, **kwargs):
+            try:
+                return method(*args, **kwargs)
+            except Exception as exc:
+                reason = reasons.get(str(exc), "configuration_or_unclassified_failure") if isinstance(exc, GatewayError) else "unclassified_failure"
+                logger.warning("PayWay operation=%s validation_failure=%s", operation, reason)
+                raise
+        return wrapped
+    return decorate
+
+
+def response_diagnostic(operation, http_status, response):
+    """Only numeric protocol codes and fixed field/type names may leave the client."""
+    status = response.get("status") if isinstance(response, dict) else None
+    data = response.get("data") if isinstance(response, dict) else None
+    code = status.get("code") if isinstance(status, dict) else None
+    code = str(code) if type(code) in (str, int) and re.fullmatch(r"[0-9]{1,6}", str(code)) else "missing_or_unrecognized"
+    known = ("original_amount", "total_amount", "payment_amount", "refund_amount", "payment_currency", "original_currency", "payment_status", "payment_status_code", "apv")
+    shapes = {key: (type(data[key]).__name__ if key in data else "missing") for key in known} if isinstance(data, dict) else {}
+    logger.warning("PayWay operation=%s http_status=%s gateway_code=%s data_type=%s fields=%s",
+        operation, http_status, code, type(data).__name__, shapes)
+
+
+def currency_diagnostic(data, expected):
+    def describe(key):
+        if key not in data:
+            return {"format": "missing", "matches_expected": False}
+        value = data[key]
+        if value is None:
+            kind = "null"
+        elif not isinstance(value, str):
+            kind = "non_string"
+        elif not value:
+            kind = "empty"
+        elif not re.fullmatch(r"[A-Z]{3}", value):
+            kind = "invalid_format"
+        elif value not in ("USD", "KHR"):
+            kind = "unsupported_code"
+        else:
+            kind = "supported_code"
+        return {"format": kind, "matches_expected": value == expected}
+    logger.warning("PayWay operation=%s currency_fields=%s", "verify",
+        {key: describe(key) for key in ("original_currency", "payment_currency")})
 
 
 class PayWayClient:
@@ -38,8 +121,8 @@ class PayWayClient:
 
     def __init__(self, config, *, require_callback=True):
         self.config = config
-        # Only explicit internal probes may omit the optional QR API field.
-        # Application services/public readiness retain the stricter default.
+        # QR callback delivery is optional; services and the worker explicitly
+        # allow omission. Callback readiness uses the stricter default.
         self.require_callback = require_callback
 
     def ensure_configured(self):
@@ -97,16 +180,24 @@ class PayWayClient:
             self.HOST, timeout=self.config.get("PAYWAY_CONNECT_TIMEOUT", 5),
             context=ssl.create_default_context(),
         )
+        operation = {self.QR_PATH: "initialize", self.CHECK_PATH: "verify", self.CLOSE_PATH: "close"}.get(path, "unknown")
         try:
             connection.connect()
             connection.sock.settimeout(self.config.get("PAYWAY_READ_TIMEOUT", 15))
             connection.request("POST", path, body.encode(), {"Content-Type": "application/json"})
             response = connection.getresponse()
             raw = response.read(2_000_001)
-            if response.status != 200 or len(raw) > 2_000_000:
+            if len(raw) > 2_000_000:
+                response_diagnostic(operation, response.status, None)
                 raise GatewayError("Gateway request failed")
-            result = json.loads(raw, parse_float=Decimal,
-                                parse_constant=lambda _: None)
+            try:
+                result = json.loads(raw, parse_float=Decimal, parse_constant=lambda _: None)
+            except ValueError:
+                response_diagnostic(operation, response.status, None)
+                raise
+            response_diagnostic(operation, response.status, result)
+            if response.status != 200:
+                raise GatewayError("Gateway request failed")
             if not isinstance(result, dict):
                 raise GatewayError("Malformed gateway response")
             return result
@@ -134,10 +225,14 @@ class PayWayClient:
         if transaction_id is not None and status.get("tran_id") != transaction_id:
             raise GatewayError("Gateway transaction mismatch")
 
+    @diagnostic_operation("initialize")
     def initialize(self, context):
         payload = self._payload(context)
         lifetime = self.config.get("PAYWAY_QR_LIFETIME_MINUTES", 15)
-        payload.update(amount=context.amount, currency=context.currency,
+        # SQLAlchemy returns Currency(str, Enum): str(member) is "Currency.USD",
+        # while JSON encodes "USD". Sign exactly the value sent on the wire.
+        currency = context.currency.value if isinstance(context.currency, Enum) else context.currency
+        payload.update(amount=context.amount, currency=currency,
                        purchase_type="purchase", payment_option="abapay_khqr",
                        lifetime=lifetime, qr_image_template="template3_color")
         callback = self.config.get("PAYWAY_CALLBACK_URL")
@@ -163,6 +258,7 @@ class PayWayClient:
                              qr_image=response["qrImage"], abapay_deeplink=response["abapay_deeplink"],
                              expires_at=expires)
 
+    @diagnostic_operation("verify")
     def verify(self, context):
         payload = self._payload(context)
         payload["hash"] = self._sign(payload, ("req_time", "merchant_id", "tran_id"))
@@ -171,16 +267,38 @@ class PayWayClient:
         data = response.get("data")
         if not isinstance(data, dict):
             raise GatewayError("Missing transaction details")
-        self._amount(data.get("original_amount"), context.amount)
-        self._amount(data.get("total_amount"), context.amount)
-        if data.get("payment_currency") != context.currency:
-            raise GatewayError("Gateway currency mismatch")
+        currency_diagnostic(data, context.currency)
         status = data.get("payment_status")
         codes = {"APPROVED": 0, "PENDING": 2, "DECLINED": 3, "CANCELLED": 7}
         code = data.get("payment_status_code")
-        if status not in codes or type(code) is not int or code != codes[status]:
+        known_status = status if isinstance(status, str) and status in codes else "missing_or_unsupported"
+        known_code = code if type(code) is int and code in codes.values() else "missing_or_unsupported"
+        logger.warning("PayWay operation=%s payment_status=%s payment_status_code=%s",
+            "verify", known_status, known_code)
+        if known_status == "missing_or_unsupported" or type(code) is not int or code != codes[status]:
             raise GatewayError("Unsupported or contradictory gateway transaction status")
+        self._amount(data.get("original_amount"), context.amount)
+        self._amount(data.get("total_amount"), context.amount)
+        # Check Transaction does not require original_currency. If supplied,
+        # contradictory original-currency evidence must still fail closed.
+        if "original_currency" in data and data["original_currency"] != context.currency:
+            raise GatewayError("Gateway currency mismatch")
+        # An unpaid PENDING transaction may have no payer currency yet. Null,
+        # malformed or nonempty mismatched values are not covered by this case.
+        pending_without_payer_currency = status == "PENDING" and (
+            "payment_currency" not in data or data["payment_currency"] == "")
+        if not pending_without_payer_currency and data.get("payment_currency") != context.currency:
+            # Cross-currency approval needs a separately verified conversion
+            # contract; never compare a KHR payer amount as if it were USD.
+            raise GatewayError("Gateway currency mismatch")
         reference = None
+        if status != "APPROVED":
+            # An approval reference or refund contradicts nonpaid evidence.
+            # Do not discard it and authorize renewal from the status alone.
+            if data.get("apv") not in (None, ""):
+                raise GatewayError("Unsupported or contradictory gateway transaction status")
+            if "refund_amount" in data:
+                self._amount(data["refund_amount"], Decimal("0"))
         if status == "APPROVED":
             self._amount(data.get("payment_amount"), context.amount)
             self._amount(data.get("refund_amount"), Decimal("0"))
@@ -190,6 +308,7 @@ class PayWayClient:
         return GatewayResult(context.transaction_id, context.merchant_id, context.amount,
                              context.currency, status, reference=reference)
 
+    @diagnostic_operation("close")
     def close(self, context):
         payload = self._payload(context)
         payload["hash"] = self._sign(payload, ("req_time", "merchant_id", "tran_id"))

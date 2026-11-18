@@ -36,11 +36,11 @@ class TelegramTransportTests(unittest.TestCase):
         self.response.status = 200
         self.response.read.return_value = b'{"ok":true,"result":{"message_id":7}}'
 
-    def test_https_plain_text_success(self):
+    def test_https_html_success(self):
         self.assertEqual(self.service._send("<b>Product</b> *test* & x2"), 7)
         self.assertEqual(self.factory.call_args.args, ("api.telegram.org",))
         payload = json.loads(self.connection.request.call_args.kwargs["body"])
-        self.assertNotIn("parse_mode", payload)
+        self.assertEqual(payload["parse_mode"], "HTML")
         self.assertEqual(payload["text"], "<b>Product</b> *test* & x2")
         self.connection.close.assert_called_once()
 
@@ -50,6 +50,20 @@ class TelegramTransportTests(unittest.TestCase):
                 with self.assertRaises(NotificationDeliveryError):
                     self.service._send("test")
         self.factory.assert_not_called()
+
+    def test_html_escaping_and_complete_multipart_delivery(self):
+        text = self.service._text('<b>Shoe & Socks</b>')
+        self.assertEqual(text, '&lt;b&gt;Shoe &amp; Socks&lt;/b&gt;')
+        message = '\n'.join([text * 20] * 10)
+        parts = self.service._message_parts(message)
+        self.assertEqual('\n'.join(parts), message)
+        self.assertGreater(len(parts), 1)
+        self.service._send(message)
+        self.assertEqual(self.connection.request.call_count, len(parts))
+        for call in self.connection.request.call_args_list:
+            payload = json.loads(call.kwargs['body'])
+            self.assertEqual(payload['parse_mode'], 'HTML')
+            self.assertLessEqual(len(payload['text'].encode('utf-16-le')) // 2, 4096)
 
     def test_rate_limit_uses_retry_after(self):
         self.response.status = 429
@@ -111,8 +125,12 @@ class TelegramPostgresTests(unittest.TestCase):
                 self.assertEqual(connection.execute(db.select(Payment.payment_status).where(
                     Payment.id == self.payment_id)).scalar_one(), "PAID")
             self.assertIn("Customer: Dara", text)
-            self.assertIn("Shoe x 2", text)
-            self.assertIn("Total: 21.50 USD", text)
+            self.assertIn("• Shoe", text)
+            self.assertIn("Qty: 2", text)
+            self.assertIn("Price: $10.13", text)
+            self.assertIn("Payment: Online Payment", text)
+            self.assertIn("PAYMENT RECEIVED", text)
+            self.assertIn("Total: $21.50", text)
             self.assertIn(f"Event: payment:{self.payment_id}:paid", text)
             return 7
         with patch.object(TelegramNotificationService, "_send", side_effect=send) as sender:
@@ -164,9 +182,13 @@ class TelegramPostgresTests(unittest.TestCase):
         with patch.object(TelegramNotificationService, "_send", return_value=7) as sender:
             self.service.verify(self.payment_id)
         text = sender.call_args.args[0]
-        self.assertLessEqual(len(text.encode("utf-16-le")) // 2, 4096)
-        self.assertIn("more order lines", text)
-        self.assertNotIn("\nPayment: FAKE", text)
+        parts = TelegramNotificationService._message_parts(text)
+        self.assertGreater(len(parts), 1)
+        for part in parts:
+            self.assertLessEqual(len(part.encode("utf-16-le")) // 2, 4096)
+        self.assertEqual(text.count("Qty:"), 41)
+        self.assertIn("&lt;b&gt;Address&lt;/b&gt;\nPayment: FAKE", text)
+        self.assertNotIn("<b>Address</b>", text)
 
     def test_timeout_preserves_paid(self):
         with patch("app.services.notifications.telegram_notification_service.http.client.HTTPSConnection",

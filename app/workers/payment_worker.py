@@ -69,7 +69,7 @@ class PaymentWorker:
     def _payments(self):
         # Missing credentials must not claim or reschedule financial records.
         try:
-            PayWayClient(self.app.config).ensure_configured()
+            PayWayClient(self.app.config, require_callback=False).ensure_configured()
         except (GatewayError, ValueError):
             logger.warning("Payment reconciliation disabled or sandbox configuration incomplete")
             return "not_configured"

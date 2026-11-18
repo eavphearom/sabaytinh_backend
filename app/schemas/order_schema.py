@@ -6,12 +6,11 @@ these schemas do not calculate totals or select a payment for an order.
 """
 
 from collections.abc import Mapping
-from decimal import ROUND_HALF_UP
 
 from marshmallow import (
     RAISE, Schema, ValidationError, fields, missing, post_dump, validate,
 )
-
+from decimal import Decimal, ROUND_HALF_UP
 from app.enums.order_status import OrderStatus
 from app.enums.payment_method import PaymentMethod
 from app.enums.payment_status import PaymentStatus
@@ -65,6 +64,15 @@ class CheckoutItemRequestSchema(OrderRequestSchema):
 
 
 class CheckoutRequestSchema(OrderRequestSchema):
+    expected_total_amount = fields.Decimal(
+        required=True,
+        places=2,
+        as_string=False,
+        validate=validate.Range(
+            min=0,
+            max=Decimal("9999999999.99")
+        )
+    )
     delivery_method_id = fields.Integer(
         required=True, strict=True, validate=validate.Range(min=1, max=MAX_ID)
     )
@@ -102,7 +110,7 @@ class PaymentStatusUpdateRequestSchema(OrderRequestSchema):
 
 class OrderCancelRequestSchema(OrderRequestSchema):
     reason = fields.String(
-        required=True, validate=[nonblank, validate.Length(max=255)]
+        load_default=None, allow_none=True, validate=validate.Length(max=255),
     )
 
 
@@ -139,8 +147,20 @@ class PaymentResponseSchema(Schema):
     qr_image = fields.String(allow_none=True)
     abapay_deeplink = fields.String(allow_none=True)
     checkout_qr_url = fields.String(allow_none=True)
-    expires_at = timestamp()
-    checkout_status = fields.String(allow_none=True)
+    expires_at = fields.DateTime(
+        format="%d-%m-%Y %I:%M:%S %p",
+        allow_none=True
+    )    # checkout_status = fields.String(allow_none=True)
+    checkout_status = fields.Method("get_checkout_status")
+
+    def get_checkout_status(self, obj):
+        if (
+            obj.gateway_state == "READY"
+            and obj.payment_status == "PENDING"
+            and obj.qr_string
+        ):
+            return "READY"
+        return None
     checkout_message = fields.String(allow_none=True)
 
     @post_dump
@@ -254,7 +274,6 @@ class OrderHistoryResponseSchema(Schema):
     payment_status = EnumValueField()
     total_items = fields.Integer()
     preview_item = fields.Nested(OrderPreviewItemResponseSchema, allow_none=True)
-
 
 class AccountOverviewResponseSchema(Schema):
     total_orders = fields.Integer()

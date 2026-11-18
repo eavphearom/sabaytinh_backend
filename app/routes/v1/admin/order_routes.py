@@ -44,7 +44,8 @@ def update_status(order_id):
 @admin_order_bp.patch("/<int:order_id>/cancel")
 @admin_required
 def cancel(order_id):
-    data = OrderCancelRequestSchema().load(json_payload())
+    data = OrderCancelRequestSchema().load(json_payload(
+        allow_empty=True, example='{"reason": "Customer requested cancellation"}'))
     return ApiResponse.success(data=OrderService().cancel(
         order_id, int(get_jwt_identity()), data["reason"], admin=True), message="Order cancelled")
 

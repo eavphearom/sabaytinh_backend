@@ -1,3 +1,4 @@
+
 from marshmallow import Schema, fields
 
 from app.schemas.order_schema import EnumValueField, ImageURLField
@@ -10,20 +11,26 @@ class WebAccountOverviewSchema(Schema):
 
 
 class WebAccountPreviewSchema(Schema):
-    product_name = fields.String(data_key="productName")
+    product_name = fields.String()
     image = ImageURLField(allow_none=True)
-    color_name = fields.String(data_key="colorName", allow_none=True)
-    size_name = fields.String(data_key="sizeName", allow_none=True)
-    quantity = fields.Integer()
-    unit_price = fields.Float(data_key="unitPrice")
+    color = fields.String(attribute="color_name", allow_none=True)
+    size = fields.String(attribute="size_name", allow_none=True)
+    qty = fields.Integer(attribute="quantity")
+    price = fields.Float(attribute="unit_price")
 
 
 class WebAccountOrderSchema(Schema):
     id = fields.Integer()
-    order_code = fields.String(data_key="orderCode")
-    created_at = fields.DateTime(data_key="createdAt", format="%Y-%m-%dT%H:%M:%S", allow_none=True)
+    order_code = fields.String()
+    created_at = fields.DateTime(
+        format="%Y-%m-%dT%H:%M:%S",
+        allow_none=True
+    )
     total = fields.Float()
-    order_status = EnumValueField(data_key="orderStatus")
-    payment_status = EnumValueField(data_key="paymentStatus")
-    total_items = fields.Integer(data_key="totalItems")
-    preview_item = fields.Nested(WebAccountPreviewSchema, data_key="previewItem", allow_none=True)
+    order_status = EnumValueField()
+    payment_status = EnumValueField()
+    total_items = fields.Integer()
+    preview_item = fields.Nested(
+        WebAccountPreviewSchema,
+        allow_none=True
+    )

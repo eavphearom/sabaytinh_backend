@@ -34,6 +34,7 @@ class AdminUserTests(unittest.TestCase):
         for row in result.json["data"]:
             self.assertEqual(set(row), {"id", "username", "email", "role", "is_active"})
         self.assertEqual(result.json, self.get("?page_no=2&per_page=2").json)
+        self.assertEqual(result.json, self.get("?pageNo=2&perPage=2").json)
         self.assertEqual(result.headers["Cache-Control"], "no-store")
 
     def test_search_and_role(self):

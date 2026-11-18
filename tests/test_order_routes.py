@@ -129,7 +129,7 @@ class OrderAPIPostgresTests(unittest.TestCase):
         self.assertEqual(self.get("?include_deleted=true").status_code, 400)
 
     def test_disabled_checkout_and_callback_do_not_write(self):
-        for key in ("PAYWAY_PUBLIC_API_ENABLED", "PAYWAY_CALLBACK_APPROVED", "PAYWAY_SANDBOX_VERIFIED", "PAYWAY_SANDBOX_ENABLED"):
+        for key in ("PAYWAY_PUBLIC_API_ENABLED", "PAYWAY_WORKER_VERIFIED", "PAYWAY_SANDBOX_VERIFIED", "PAYWAY_SANDBOX_ENABLED"):
             self.enable()
             self.app.config["PAYWAY_SANDBOX_ENABLED"] = True
             self.app.config[key] = False
@@ -137,6 +137,15 @@ class OrderAPIPostgresTests(unittest.TestCase):
             self.assertEqual(response.status_code, 503)
             self.assertEqual(db.session.scalar(sa.select(sa.func.count()).select_from(Order)), 1)
             self.assertEqual(db.session.get(VariantStock, 1, populate_existing=True).qty, 3)
+        response = self.client.post("/testing/aba-callback", json={"tran_id": "bad", "status": "0"})
+        self.assertEqual(response.status_code, 503)
+
+    def test_checkout_without_callback_config_uses_existing_verification_flow(self):
+        self.enable()
+        self.app.config.update(PAYWAY_CALLBACK_URL="", PAYWAY_CALLBACK_SECRET="", PAYWAY_CALLBACK_APPROVED=False)
+        response = self.client.post("/api/v1/web/checkout", headers=self.headers[1], json=self.payload(1))
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.json["data"]["payment_status"], "PENDING")
         response = self.client.post("/testing/aba-callback", json={"tran_id": "bad", "status": "0"})
         self.assertEqual(response.status_code, 503)
 
@@ -188,6 +197,24 @@ class OrderAPIPostgresTests(unittest.TestCase):
         self.assertEqual(db.session.scalar(sa.select(sa.func.count()).select_from(StockMovement).where(StockMovement.reference_type == "ORDER_RETURN")), 1)
         self.assertEqual(self.status("PROCESSING").status_code, 400)
 
+    def test_cancel_request_body_errors_do_not_reach_cancellation(self):
+        for scope, user in (("admin", 2), ("web", 1)):
+            url = f"/api/v1/{scope}/orders/{self.id}/cancel"
+            with patch.object(OrderService, "cancel") as cancel:
+                for body, content_type in (("{", "application/json"),
+                                           ("null", "application/json"), ("[]", "application/json"),
+                                           ('{"reason":"No longer needed"}', "text/plain")):
+                    with self.subTest(scope=scope, body=body, content_type=content_type):
+                        response = self.client.patch(url, headers=self.headers[user],
+                            data=body, content_type=content_type)
+                        self.assertEqual(response.status_code, 400)
+                        self.assertIn('"reason"', response.json["message"])
+                for payload in ({"reason": 123}, {"reason": "x" * 256}, {"note": "No"}):
+                    self.assertEqual(self.client.patch(url, headers=self.headers[user], json=payload).status_code, 400)
+                cancel.assert_not_called()
+            self.assertEqual(db.session.get(Order, self.id).order_status, "PENDING")
+            self.assertEqual(db.session.get(VariantStock, 1).qty, 3)
+
     def test_admin_cancel_actor_and_soft_deleted_order_late_payment_evidence(self):
         self.enable()
         PaymentService().initialize(self.ids["payment_id"])
@@ -203,6 +230,39 @@ class OrderAPIPostgresTests(unittest.TestCase):
         self.assertTrue(order.is_deleted)
         self.assertEqual(order.order_status, "CANCELLED")
         self.assertEqual(order.payment_status, "PAID")
+        self.assertEqual(db.session.get(VariantStock, 1).qty, 5)
+
+    def test_optional_cancel_reason_payloads(self):
+        for scope, user in (("admin", 2), ("web", 1)):
+            with patch.object(OrderService, "cancel", return_value={}) as cancel:
+                for payload in ({}, {"reason": None}, {"reason": ""}, {"reason": "   "}):
+                    response = self.client.patch(f"/api/v1/{scope}/orders/{self.id}/cancel",
+                        headers=self.headers[user], json=payload)
+                    self.assertEqual(response.status_code, 200)
+                    self.assertEqual(cancel.call_args.args[2], payload.get("reason"))
+
+    def test_admin_cancel_without_body_preserves_audit_and_restores_once(self):
+        self.enable()
+        PaymentService().initialize(self.ids["payment_id"])
+        for _ in range(2):
+            response = self.client.patch(f"/api/v1/admin/orders/{self.id}/cancel", headers=self.headers[2])
+            self.assertEqual(response.status_code, 200)
+        payment = db.session.get(Payment, self.ids["payment_id"])
+        self.assertIsNone(payment.cancellation_reason)
+        history = response.json["data"]["status_history"][-1]
+        self.assertIsNone(history["note"])
+        self.assertEqual(history["changed_by"], 2)
+        self.assertEqual(db.session.get(VariantStock, 1).qty, 5)
+        self.assertEqual(db.session.scalar(sa.select(sa.func.count()).select_from(StockMovement)
+            .where(StockMovement.reference_type == "ORDER_RETURN")), 1)
+
+    def test_customer_cancel_blank_reason_is_stored_as_null(self):
+        self.enable()
+        PaymentService().initialize(self.ids["payment_id"])
+        response = self.client.patch(f"/api/v1/web/orders/{self.id}/cancel",
+            headers=self.headers[1], json={"reason": "   "})
+        self.assertEqual(response.status_code, 200)
+        self.assertIsNone(db.session.get(Payment, self.ids["payment_id"]).cancellation_reason)
         self.assertEqual(db.session.get(VariantStock, 1).qty, 5)
 
     def test_pending_delete_rejected_and_verified_delivered_delete_allowed(self):

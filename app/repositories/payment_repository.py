@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import or_
+from sqlalchemy import or_, and_
 
 from app.common.base_repository import BaseRepository
 from app.enums.payment_method import PaymentMethod
@@ -37,8 +37,8 @@ class PaymentRepository(BaseRepository):
     def find_pending_online_for_reconciliation(self, now, limit=100, for_update=True):
         """Return scheduled, due rows without an active lease.
 
-        NULL next_check_at means unscheduled. Expired payments are still returned
-        so the service can reconcile their final state. The caller must retain
+        NULL next_check_at means unscheduled. Expired payments and closed renewal
+        predecessors are returned so late approvals are not ignored. The caller must retain
         the transaction and set leases before committing; this does not claim a
         durable lease or perform gateway operations.
         """
@@ -48,7 +48,9 @@ class PaymentRepository(BaseRepository):
             raise ValueError("now must be a naive local datetime")
         query = self._query().where(
             Payment.payment_method == PaymentMethod.ONLINE.value,
-            Payment.payment_status == PaymentStatus.PENDING.value,
+            or_(Payment.payment_status == PaymentStatus.PENDING.value,
+                and_(Payment.payment_status == PaymentStatus.CANCELLED.value,
+                     Payment.closure_verified_at.is_not(None))),
             Payment.next_check_at <= now,
             or_(Payment.gateway_lease_until.is_(None), Payment.gateway_lease_until <= now),
         ).order_by(Payment.next_check_at, Payment.id).limit(limit)

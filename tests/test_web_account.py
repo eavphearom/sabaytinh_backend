@@ -87,20 +87,22 @@ class WebAccountTests(unittest.TestCase):
         response = self.get("orders?search=ORD-001")
         self.assertEqual(response.status_code, 200)
         row = response.json["data"][0]
-        self.assertEqual(set(row), {"id", "orderCode", "createdAt", "total", "orderStatus", "paymentStatus", "totalItems", "previewItem"})
-        self.assertEqual(row["totalItems"], 2)
-        self.assertEqual(row["createdAt"], "2026-11-10T10:31:00")
+        self.assertEqual(set(row), {"id", "order_code", "created_at", "total", "order_status", "payment_status", "total_items", "preview_item"})
+        self.assertEqual(row["total_items"], 2)
+        self.assertEqual(row["created_at"], "2026-11-10T10:31:00")
         self.assertEqual(row["total"], 99.0)
-        self.assertEqual(row["previewItem"], {"productName": "Snapshot2", "image": "http://localhost/uploads/products/a.png",
-            "colorName": "Black", "sizeName": "42", "quantity": 5, "unitPrice": 40.25})
+        self.assertEqual(row["preview_item"], {"product_name": "Snapshot2", "image": "http://localhost/uploads/products/a.png",
+            "color": "Black", "size": "42", "qty": 5, "price": 40.25})
         empty = self.get("orders?search=ORD-002").json["data"][0]
-        self.assertIsNone(empty["previewItem"])
-        self.assertEqual(empty["totalItems"], 0)
+        self.assertIsNone(empty["preview_item"])
+        self.assertEqual(empty["total_items"], 0)
 
     def test_pagination_default_newest_and_customer_isolation(self):
         response = self.get("orders?page_no=2&per_page=2")
         self.assertEqual([r["id"] for r in response.json["data"]], [3, 2])
         self.assertEqual(response.json["pagination"], {"page_no": 2, "per_page": 2, "total": 5, "total_page": 3})
+        aliases = self.get("orders?pageNo=2&perPage=2")
+        self.assertEqual(aliases.json, response.json)
         self.assertEqual([r["id"] for r in self.get("orders", 2).json["data"]], [7])
         self.assertEqual(self.get("orders?search=ORD-007").json["data"], [])
         self.assertEqual(self.get("orders?customer_id=2").status_code, 400)
@@ -128,7 +130,8 @@ class WebAccountTests(unittest.TestCase):
     def test_invalid_filters_return_400(self):
         for query in ("page_no=0", "per_page=101", "page_no=x", "sort_by=orderCode", "sort_by=created_at",
                       "sort_dir=bad", "status=CONFIRMED", "status=", "status=paid", "payment_status=PAID",
-                      "include_deleted=true", "search=a&search=b", "page_no=999999999999999999999"):
+                      "include_deleted=true", "search=a&search=b", "page_no=999999999999999999999",
+                      "pageNo=x", "perPage=101", "pageNo=0", "pageNo=2&page_no=2"):
             with self.subTest(query=query):
                 self.assertEqual(self.get("orders?" + query).status_code, 400)
 

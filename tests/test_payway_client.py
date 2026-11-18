@@ -2,11 +2,14 @@ import base64
 from decimal import Decimal
 import hashlib
 import hmac
+import json
+from dataclasses import replace
 from unittest import TestCase
 from unittest.mock import patch
 
 from app.services.payments.payway_client import PayWayClient
 from app.services.payments.payment_strategy import PaymentContext, GatewayError
+from app.enums.currency import Currency
 
 
 class PayWayClientTests(TestCase):
@@ -54,6 +57,30 @@ class PayWayClientTests(TestCase):
             with self.subTest(response=response), patch.object(self.client, "_post", return_value=response):
                 with self.assertRaises(GatewayError):
                     self.client.initialize(self.context)
+
+    def test_database_currency_enum_signature_matches_transmitted_json(self):
+        # SQLAlchemy returns Currency members; standalone probes use plain strings.
+        # Exercise the real HTTP serializer, with transport mocked, and reconstruct
+        # the HMAC from the transmitted JSON instead of from the Python payload.
+        for currency in ("USD", Currency.USD):
+            for callback in ("", "https://example.test/callback"):
+                with self.subTest(currency=type(currency).__name__, callback=bool(callback)):
+                    client = PayWayClient({**self.client.config, "PAYWAY_CALLBACK_URL": callback},
+                                          require_callback=False)
+                    with patch("app.services.payments.payway_client.http.client.HTTPSConnection") as transport:
+                        response = transport.return_value.getresponse.return_value
+                        response.status = 200
+                        response.read.return_value = json.dumps(self.qr(), default=str).encode()
+                        client.initialize(replace(self.context, currency=currency))
+                        request = transport.return_value.request.call_args.args
+                    payload = json.loads(request[2], parse_float=Decimal)
+                    self.assertEqual(payload["currency"], "USD")
+                    message = (payload["req_time"] + "test_merchant" + "testtransaction" + "10.00"
+                               + "purchase" + "abapay_khqr" + payload.get("callback_url", "")
+                               + "USD" + "15" + "template3_color")
+                    expected = base64.b64encode(hmac.new(b"unit-test-key", message.encode(),
+                                                       hashlib.sha512).digest()).decode()
+                    self.assertEqual(payload["hash"], expected)
 
     def test_all_qr_fields_match_spring_order_and_transaction_signing(self):
         fields = ("req_time", "merchant_id", "tran_id", "amount", "items", "first_name",
