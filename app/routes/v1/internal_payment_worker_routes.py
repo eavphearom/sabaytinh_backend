@@ -79,7 +79,7 @@ def run_worker():
         return jsonify(status=status, payments_checked=payment_count,
                        outcome=outcome, reasons=sorted(reasons), payments_unresolved=unresolved,
                        payments_manual_review=review,
-                       notifications_delivered=telegram if type(telegram) is int else 0), 503 if issues else 200
+                       notifications_delivered=telegram if type(telegram) is int else 0), 503 if operational else 200
     except WorkerStopped as exc:
         logger.error("Payment cron operational_failure=%s", exc.reason)
         return jsonify(status="failed", outcome="operational_failure", reason=exc.reason), 503
