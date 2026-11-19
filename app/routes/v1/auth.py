@@ -20,6 +20,9 @@ from app.exceptions.api_exception import (
 )
 from app.utils.file_util import FileUtil
 from app.security.jwt_utils import authenticated_user
+from app.schemas.oauth_schema import OAuthStartSchema, OAuthLoginSchema
+from app.services.auth.oauth_service import OAuthService
+from urllib.parse import urlsplit
 
 
 auth_bp = Blueprint(
@@ -27,6 +30,38 @@ auth_bp = Blueprint(
     __name__,
     url_prefix="/api/v1/auth"
 )
+
+
+@auth_bp.after_request
+def auth_no_store(response):
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+def oauth_payload():
+    from flask import current_app
+    from app.exceptions.api_exception import ForbiddenException
+    request.max_content_length = 16384
+    redirect = current_app.config.get("GOOGLE_REDIRECT_URI", "")
+    url = urlsplit(redirect)
+    expected_origin = f"{url.scheme}://{url.netloc}"
+    if not redirect:
+        OAuthService().strategy("google").configuration()
+    if request.headers.get("Origin") != expected_origin:
+        raise ForbiddenException("Invalid login origin")
+    return get_json_payload()
+
+
+@auth_bp.post("/google/start")
+def google_start():
+    data = OAuthStartSchema().load(oauth_payload())
+    return ApiResponse.success(data=OAuthService().start("google", data))
+
+
+@auth_bp.post("/google/login")
+def google_login():
+    data = OAuthLoginSchema().load(oauth_payload())
+    return ApiResponse.success(data=OAuthService().login("google", data), message="Login successful")
 
 
 def get_json_payload():

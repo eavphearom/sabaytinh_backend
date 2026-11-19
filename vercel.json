@@ -2,6 +2,6 @@
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "regions": ["syd1"],
   "functions": {
-    "run.py": { "maxDuration": 60 }
+    "run.py": { "maxDuration": 60, "includeFiles": "app/assets/fonts/**" }
   }
 }

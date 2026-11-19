@@ -6,6 +6,7 @@ from app.routes.v1.order_route_util import json_payload, paginated
 from app.schemas.order_schema import OrderCancelRequestSchema
 from app.security.decorators import customer_required
 from app.services.order_service import OrderService
+from app.services.invoice_service import InvoiceService
 
 
 web_order_bp = Blueprint("web_orders", __name__, url_prefix="/api/v1/web")
@@ -44,6 +45,36 @@ def account_overview():
 @customer_required
 def detail(order_id):
     return ApiResponse.success(data=OrderService().get_detail(order_id, g.customer_id))
+
+
+@web_order_bp.get("/orders/<int:order_id>/invoice")
+@customer_required
+def invoice_detail(order_id):
+    return ApiResponse.success(data=InvoiceService().get_customer_invoice(order_id, g.customer_id))
+
+
+@web_order_bp.get("/orders/<int:order_id>/invoice/pdf")
+@customer_required
+def invoice_pdf(order_id):
+    from flask import send_file
+    from io import BytesIO
+    from app.services.invoice_pdf_service import render_invoice_pdf
+    data = InvoiceService().get_customer_invoice(order_id, g.customer_id)
+    return send_file(BytesIO(render_invoice_pdf(data)), mimetype="application/pdf",
+                     as_attachment=True, download_name=f"invoice-{data['id']}.pdf", max_age=0)
+
+
+@web_order_bp.get("/orders/<int:order_id>/invoice/document")
+@customer_required
+def invoice_document(order_id):
+    """JSON transport avoids download-manager interception of authenticated XHR."""
+    import base64
+    from app.services.invoice_pdf_service import render_invoice_pdf
+    data = InvoiceService().get_customer_invoice(order_id, g.customer_id)
+    return ApiResponse.success(data={
+        "content_type": "application/pdf",
+        "content_base64": base64.b64encode(render_invoice_pdf(data)).decode("ascii"),
+    })
 
 
 @web_order_bp.patch("/orders/<int:order_id>/cancel")

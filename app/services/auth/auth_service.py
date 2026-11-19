@@ -43,6 +43,9 @@ class AuthService:
         if not username:
             raise BadRequestException("Username is required")
 
+        from app.repositories.auth_identity_repository import AuthIdentityRepository
+        AuthIdentityRepository.lock_email(email)
+
         if self.user_repository.find_by_email(email):
             raise DuplicateException("Email already exists")
 
@@ -131,6 +134,10 @@ class AuthService:
                 "Account role is unavailable"
             )
 
+        return self.create_session(user)
+
+    def create_session(self, user):
+        """Issue the same application session for local and verified provider logins."""
         try:
             session_id = uuid.uuid4()
             now = datetime.now(timezone.utc)
