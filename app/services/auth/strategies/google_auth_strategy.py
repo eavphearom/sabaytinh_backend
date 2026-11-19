@@ -41,11 +41,27 @@ class GoogleAuthStrategy:
         client, secret, redirect = (config.get(key) for key in
             ("GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET", "GOOGLE_REDIRECT_URI"))
         signing_key = config.get("SECRET_KEY")
-        url = urlsplit(redirect or "")
-        if (not all(isinstance(v, str) and v.strip() for v in (client, secret, redirect, signing_key))
+        missing = [key for key, value in (
+            ("GOOGLE_CLIENT_ID", client), ("GOOGLE_CLIENT_SECRET", secret),
+            ("GOOGLE_REDIRECT_URI", redirect), ("SECRET_KEY", signing_key),
+        ) if not isinstance(value, str) or not value.strip()]
+        if missing:
+            # Names only: never include values, token responses or request payloads.
+            current_app.logger.error("Google login configuration missing: %s", ", ".join(missing))
+            raise ApiException("Google login is not configured: missing " + ", ".join(missing),
+                               503, "Service Unavailable")
+        try:
+            url = urlsplit(redirect)
+            invalid = (redirect != redirect.strip() or any(c.isspace() for c in redirect)
                 or not url.hostname or url.username or url.password or url.query or url.fragment
-                or (url.scheme != "https" and not (url.scheme == "http" and url.hostname in ("localhost", "127.0.0.1")))):
-            raise ApiException("Google login is not configured", 503, "Service Unavailable")
+                or url.port == 0
+                or (url.scheme != "https" and not (url.scheme == "http" and url.hostname in ("localhost", "127.0.0.1"))))
+        except ValueError:
+            invalid = True
+        if invalid:
+            current_app.logger.error("Google login configuration invalid: GOOGLE_REDIRECT_URI")
+            raise ApiException("Google login is not configured: invalid GOOGLE_REDIRECT_URI",
+                               503, "Service Unavailable")
         return client, secret, redirect, URLSafeTimedSerializer(signing_key, salt="google-login-v1")
 
     def start(self, challenge):

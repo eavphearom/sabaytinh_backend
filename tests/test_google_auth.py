@@ -81,6 +81,22 @@ class GoogleStrategyTests(unittest.TestCase):
         self.app.config["GOOGLE_CLIENT_SECRET"] = ""
         with self.assertRaises(ApiException): self.strategy.start(CHALLENGE)
 
+    def test_configuration_errors_identify_names_without_values(self):
+        for key in ("GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET", "GOOGLE_REDIRECT_URI", "SECRET_KEY"):
+            with self.subTest(key=key), patch.dict(self.app.config, {key: ""}):
+                with self.assertRaises(ApiException) as error:
+                    self.strategy.configuration()
+                self.assertEqual(error.exception.status_code, 503)
+                self.assertIn("missing " + key, str(error.exception))
+                self.assertNotIn(CONFIG["GOOGLE_CLIENT_SECRET"], str(error.exception))
+        for value in ('"https://website.example/callback"', 'https://website.example:invalid/callback',
+                      'https://website.example/callback ', 'not-a-url'):
+            with self.subTest(value=value), patch.dict(self.app.config, GOOGLE_REDIRECT_URI=value):
+                with self.assertRaises(ApiException) as error:
+                    self.strategy.configuration()
+                self.assertIn("invalid GOOGLE_REDIRECT_URI", str(error.exception))
+                self.assertNotIn(value, str(error.exception))
+
     def test_rejected_exchange_never_validates_identity(self):
         for status in (400, 401, 302, 429, 503):
             with patch(MODULE + ".requests.post", return_value=Mock(status_code=status)), patch(MODULE + ".id_token.verify_oauth2_token") as verify:
